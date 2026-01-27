@@ -1,0 +1,9 @@
+# Banco local
+financeiro.db
+*.db
+*.sqlite
+*.sqlite3
+
+# cache
+__pycache__/
+.streamlit/
