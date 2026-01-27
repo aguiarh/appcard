@@ -695,16 +695,14 @@ with tab_lancar:
                     "Status": str(row.get("Status", "")).strip(),
                 })
 
-            if erros:
-                st.error("Corrija antes de salvar:")
-
-- " + "
-- ".join(erros))
-            else:
-                inserir_varios(linhas)
-                toast_ok("Parcelas salvas com sucesso", 5)
-                st.session_state.pop("previa_df", None)
-                st.rerun()
+    if erros:
+        st.error("Corrija antes de salvar:\n\n- " + "\n- ".join(erros))
+    else:
+        inserir_varios(linhas)
+        toast_ok("Parcelas salvas com sucesso", 5)
+        st.session_state.pop("previa_df", None)
+        st.rerun()
+           
     else:
         st.info("Gere uma prévia para visualizar e salvar as parcelas.")
 
