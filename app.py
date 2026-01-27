@@ -696,7 +696,7 @@ with tab_lancar:
                 })
 
             if erros:
-                st.error("Corrija antes de salvar:
+                st.error("Corrija antes de salvar:")
 
 - " + "
 - ".join(erros))
