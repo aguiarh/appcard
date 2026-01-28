@@ -85,10 +85,11 @@ def logout_button() -> None:
 # Helpers
 # =========================
 def toast_ok(msg: str, seconds: int = 3) -> None:
-    ph = st.empty()
-    ph.success(f"OK ✅ {msg}")
-    time.sleep(max(int(seconds), 1))
-    ph.empty()
+    # Não bloqueia a UI com sleep (Streamlit roda script inteiro a cada interação)
+    try:
+        st.toast(msg, icon="✅")
+    except Exception:
+        st.success(msg)
 
 def br_money(v: float) -> str:
     return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -358,13 +359,14 @@ with tabs[0]:
         st.markdown("### Ajustar contas (saldo inicial / ativar-desativar)")
         df_edit = dfc.copy()
         df_edit = df_edit[["id", "nome", "tipo", "saldo_inicial", "ativo"]]
+        df_edit = df_edit.set_index("id")
         df_edit["saldo_inicial"] = df_edit["saldo_inicial"].fillna(0.0).astype(float)
 
         edited = st.data_editor(
             df_edit,
             use_container_width=True,
             hide_index=True,
-            disabled=["id", "nome", "tipo"],
+            disabled=["nome", "tipo"],
             column_config={
                 "saldo_inicial": st.column_config.NumberColumn("Saldo inicial", help="Apenas para contas do tipo CONTA", format="%.2f"),
                 "ativo": st.column_config.CheckboxColumn("Ativo"),
@@ -377,7 +379,7 @@ with tabs[0]:
             if st.button("Salvar alterações", type="primary", use_container_width=True, key="contas_save"):
                 rows = []
                 for _, r in edited.iterrows():
-                    rows.append((float(r["saldo_inicial"]), bool(r["ativo"]), int(r["id"])))
+                    rows.append((float(r["saldo_inicial"]), bool(r["ativo"]), int(r.name)))
                 exec_many("UPDATE contas SET saldo_inicial=%s, ativo=%s WHERE id=%s", rows)
                 toast_ok("Contas atualizadas", 2)
                 st.rerun()
@@ -417,10 +419,10 @@ with tabs[1]:
     else:
         st.markdown("### Editar categorias")
         edited = st.data_editor(
-            df_cat,
+            df_cat.set_index("id"),
             use_container_width=True,
             hide_index=True,
-            disabled=["id"],
+            disabled=[],
             column_config={
                 "nome": st.column_config.TextColumn("Nome"),
                 "ativo": st.column_config.CheckboxColumn("Ativo"),
@@ -432,7 +434,7 @@ with tabs[1]:
             if st.button("Salvar categorias", type="primary", use_container_width=True, key="cat_save"):
                 rows = []
                 for _, r in edited.iterrows():
-                    rows.append((str(r["nome"]).strip(), bool(r["ativo"]), int(r["id"])))
+                    rows.append((str(r["nome"]).strip(), bool(r["ativo"]), int(r.name)))
                 exec_many("UPDATE categorias SET nome=%s, ativo=%s WHERE id=%s", rows)
                 toast_ok("Categorias atualizadas", 2)
                 st.rerun()
@@ -477,9 +479,9 @@ with tabs[2]:
         for col in ["competencia","dt_inicio","dt_fim","dt_fechamento","dt_vencimento"]:
             df_view[col] = pd.to_datetime(df_view[col]).dt.strftime("%d/%m/%Y")
         df_view = df_view.rename(columns={
-            "id":"ID","cartao":"Cartão","competencia":"Competência","dt_inicio":"Início","dt_fim":"Fim","dt_fechamento":"Fechamento","dt_vencimento":"Vencimento","status":"Status"
+            "cartao":"Cartão","competencia":"Competência","dt_inicio":"Início","dt_fim":"Fim","dt_fechamento":"Fechamento","dt_vencimento":"Vencimento","status":"Status"
         })
-        cols = ["ID","Cartão","Competência","Início","Fim","Fechamento","Vencimento","Status"]
+        cols = ["Cartão","Competência","Início","Fim","Fechamento","Vencimento","Status"]
         df_view = df_view[cols]
         st.dataframe(df_view, use_container_width=True, hide_index=True)
 
@@ -487,11 +489,13 @@ with tabs[2]:
         for col in ["competencia", "dt_inicio", "dt_fim", "dt_fechamento", "dt_vencimento"]:
             df_show[col] = pd.to_datetime(df_show[col]).dt.date
 
+        df_show = df_show.set_index("id")
+
         edited_fat = st.data_editor(
             df_show,
             use_container_width=True,
             hide_index=True,
-            disabled=["id", "cartao", "competencia"],
+            disabled=["cartao", "competencia"],
             column_config={
                 "dt_inicio": st.column_config.DateColumn("Início"),
                 "dt_fim": st.column_config.DateColumn("Fim"),
@@ -512,7 +516,7 @@ with tabs[2]:
                         pd.to_datetime(r["dt_fechamento"]).date().isoformat(),
                         pd.to_datetime(r["dt_vencimento"]).date().isoformat(),
                         str(r["status"]),
-                        int(r["id"]),
+                        int(r.name),
                     )
                 )
 
@@ -637,7 +641,7 @@ with tabs[3]:
                 opts = []
                 for _, r in dff.iterrows():
                     label = f"{r['cartao']} • {pd.to_datetime(r['competencia']).strftime('%m/%Y')} • vence {pd.to_datetime(r['dt_vencimento']).strftime('%d/%m/%Y')} • {r['status']}"
-                    opts.append((int(r["id"]), label))
+                    opts.append((int(r.name), label))
                 default_idx = 0
                 if suggested:
                     for i, (fid, _) in enumerate(opts):
@@ -799,11 +803,13 @@ with tabs[3]:
             st.info("Nada para mostrar.")
         else:
             df_show = df.copy()
-            df_show = df_show.rename(columns={"id":"ID", "dt_competencia":"Data", "tipo":"Tipo", "descricao":"Descrição", "valor":"Valor", "conta":"Conta", "categoria":"Categoria", "prestacao":"Parcela"})
+            # Não exibir ID na tabela
+            if "id" in df_show.columns:
+                df_show = df_show.drop(columns=["id"])
+            df_show = df_show.rename(columns={"dt_competencia":"Data", "tipo":"Tipo", "descricao":"Descrição", "valor":"Valor", "conta":"Conta", "categoria":"Categoria", "prestacao":"Parcela"})
             df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
             df_show["Valor"] = df_show["Valor"].apply(br_money)
-            # Garante ID visível e primeiro
-            cols = ["ID","Data","Tipo","Descrição","Valor","Conta","Categoria","Parcela"]
+            cols = ["Data","Tipo","Descrição","Valor","Conta","Categoria","Parcela"]
             cols = [c for c in cols if c in df_show.columns] + [c for c in df_show.columns if c not in cols]
             df_show = df_show[cols]
             st.dataframe(df_show, use_container_width=True, hide_index=True)
@@ -830,8 +836,8 @@ with tabs[3]:
                     contas_all = list_contas(only_active=False)
                     cats_all = fetch_df("SELECT id, nome FROM categorias ORDER BY nome")
 
-                    conta_map = {int(r["id"]): f'{r["nome"]} ({r["tipo"]})' for _, r in contas_all.iterrows()}
-                    cat_map = {int(r["id"]): r["nome"] for _, r in cats_all.iterrows()}
+                    conta_map = {int(r.name): f'{r["nome"]} ({r["tipo"]})' for _, r in contas_all.iterrows()}
+                    cat_map = {int(r.name): r["nome"] for _, r in cats_all.iterrows()}
 
                     c1, c2, c3 = st.columns(3)
                     with c1:
@@ -1055,10 +1061,13 @@ with tabs[4]:
                 st.info("Nenhuma RECEITA pendente encontrada nesse mês.")
             else:
                 df_show = df_pend.copy()
-                df_show = df_show.rename(columns={"id":"ID","descricao":"Descrição","valor":"Valor","dt_competencia":"Data"})
+                # Não exibir ID na tabela
+                if "id" in df_show.columns:
+                    df_show = df_show.drop(columns=["id"])
+                df_show = df_show.rename(columns={"descricao":"Descrição","valor":"Valor","dt_competencia":"Data"})
                 df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
                 df_show["Valor"] = df_show["Valor"].apply(br_money)
-                cols = ["ID","Data","Descrição","Valor"]
+                cols = ["Data","Descrição","Valor"]
                 cols = [c for c in cols if c in df_show.columns] + [c for c in df_show.columns if c not in cols]
                 df_show = df_show[cols]
                 st.dataframe(df_show, use_container_width=True, hide_index=True)
@@ -1136,7 +1145,7 @@ with tabs[5]:
             # options
             opts = []
             for _, r in dff.iterrows():
-                fid = int(r["id"])
+                fid = int(r.name)
                 total = total_fatura(fid)
                 label = f"{pd.to_datetime(r['competencia']).strftime('%m/%Y')} • vence {pd.to_datetime(r['dt_vencimento']).strftime('%d/%m/%Y')} • {r['status']} • R$ {br_money(total)}"
                 opts.append((fid, label, r["status"]))
