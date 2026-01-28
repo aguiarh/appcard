@@ -657,7 +657,7 @@ else:
                 st.session_state.pop("fat_del_confirm", None)
                 st.rerun()
 
-    st.divider()
+st.divider()
 
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
@@ -1188,7 +1188,7 @@ with tabs[4]:
                 SELECT id, descricao, valor::float8 AS valor, dt_competencia
                   FROM lancamentos
                  WHERE tipo='RECEITA'
-                   AND lower(trim(COALESCE(status,'Pendente'))) = 'pendente'
+                   AND COALESCE(status,'Pendente')='Pendente'
                    AND dt_competencia BETWEEN %s AND %s
             """
 
