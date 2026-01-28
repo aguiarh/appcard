@@ -605,109 +605,109 @@ with tabs[2]:
 
     st.divider()
 
-st.markdown("### Excluir fatura")
-st.caption("Regra: só permite excluir se não existir nenhum lançamento vinculado a ela.")
+    st.markdown("### Excluir fatura")
+    st.caption("Regra: só permite excluir se não existir nenhum lançamento vinculado a ela.")
 
-df_fat_del = fetch_df(
-    """
-    SELECT f.id,
-           c.nome AS cartao,
-           f.competencia,
-           f.dt_inicio,
-           f.dt_fim,
-           f.dt_vencimento,
-           f.status
-      FROM faturas f
-      JOIN contas c ON c.id = f.conta_id
-     ORDER BY c.nome, f.competencia DESC
-    """
-)
-
-if df_fat_del.empty:
-    st.info("Nenhuma fatura para excluir.")
-else:
-    # Monta label amigável (sem expor ID)
-    df_lbl = df_fat_del.copy()
-    df_lbl["competencia"] = pd.to_datetime(df_lbl["competencia"]).dt.strftime("%m/%Y")
-    df_lbl["dt_vencimento"] = pd.to_datetime(df_lbl["dt_vencimento"]).dt.strftime("%d/%m/%Y")
-    df_lbl["label"] = df_lbl["cartao"].astype(str) + " • " + df_lbl["competencia"] + " • Venc: " + df_lbl["dt_vencimento"] + " • " + df_lbl["status"].astype(str)
-
-    fatura_id = st.selectbox(
-        "Selecione a fatura",
-        options=df_lbl["id"].tolist(),
-        format_func=lambda k: df_lbl.loc[df_lbl["id"] == k, "label"].iloc[0],
-        key="fat_del_id",
+    df_fat_del = fetch_df(
+        """
+        SELECT f.id,
+               c.nome AS cartao,
+               f.competencia,
+               f.dt_inicio,
+               f.dt_fim,
+               f.dt_vencimento,
+               f.status
+          FROM faturas f
+          JOIN contas c ON c.id = f.conta_id
+         ORDER BY c.nome, f.competencia DESC
+        """
     )
 
-    row_cnt = fetch_one("SELECT COUNT(*)::int AS qtd FROM lancamentos WHERE fatura_id=%s", [int(fatura_id)])
-    qtd = int(row_cnt["qtd"]) if row_cnt else 0
-
-    if qtd > 0:
-        st.warning(f"Esta fatura possui {qtd} lançamento(s) vinculado(s). Exclua/ajuste os lançamentos primeiro.")
+    if df_fat_del.empty:
+        st.info("Nenhuma fatura para excluir.")
     else:
-        confirm = st.checkbox("Confirmo que quero excluir esta fatura", key="fat_del_confirm")
-        if st.button("Excluir fatura", type="primary", use_container_width=True, key="fat_del_btn"):
-            if not confirm:
-                st.error("Marque a confirmação.")
-            else:
-                exec_sql("DELETE FROM faturas WHERE id=%s", [int(fatura_id)])
-                clear_cache()
-                st.toast("Fatura excluída", icon="✅")
-                st.session_state.pop("fat_del_id", None)
-                st.session_state.pop("fat_del_confirm", None)
-                st.rerun()
+        # Monta label amigável (sem expor ID)
+        df_lbl = df_fat_del.copy()
+        df_lbl["competencia"] = pd.to_datetime(df_lbl["competencia"]).dt.strftime("%m/%Y")
+        df_lbl["dt_vencimento"] = pd.to_datetime(df_lbl["dt_vencimento"]).dt.strftime("%d/%m/%Y")
+        df_lbl["label"] = df_lbl["cartao"].astype(str) + " • " + df_lbl["competencia"] + " • Venc: " + df_lbl["dt_vencimento"] + " • " + df_lbl["status"].astype(str)
 
-    st.divider()
+        fatura_id = st.selectbox(
+            "Selecione a fatura",
+            options=df_lbl["id"].tolist(),
+            format_func=lambda k: df_lbl.loc[df_lbl["id"] == k, "label"].iloc[0],
+            key="fat_del_id",
+        )
 
-    contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
-    if contas_cartao.empty:
-        st.info("Cadastre pelo menos 1 cartão em Contas.")
-    else:
-        cartao_nome = st.selectbox("Cartão", contas_cartao["nome"].tolist(), key="f_cartao")
-        cartao_id = int(contas_cartao.loc[contas_cartao["nome"] == cartao_nome, "id"].iloc[0])
+        row_cnt = fetch_one("SELECT COUNT(*)::int AS qtd FROM lancamentos WHERE fatura_id=%s", [int(fatura_id)])
+        qtd = int(row_cnt["qtd"]) if row_cnt else 0
 
-        st.markdown("#### Criar/Atualizar fatura do mês")
-        c1, c2, c3, c4, c5 = st.columns(5)
-        with c1:
-            competencia = st.date_input("Competência (dia 01)", value=month_start(date.today()), key="f_comp")
-            competencia = month_start(competencia)
-        with c2:
-            dt_inicio = st.date_input("Início", value=(competencia - relativedelta(months=1) + relativedelta(days=2)), key="f_ini")
-        with c3:
-            dt_fim = st.date_input("Fim", value=(competencia + relativedelta(days=1)), key="f_fim")
-        with c4:
-            dt_fech = st.date_input("Fechamento", value=dt_fim, key="f_fech")
-        with c5:
-            dt_venc = st.date_input("Vencimento", value=(competencia + relativedelta(days=24)), key="f_venc")
-
-        if st.button("Salvar fatura", type="primary", use_container_width=True, key="f_save"):
-            if dt_inicio > dt_fim:
-                st.error("Início não pode ser maior que Fim.")
-            else:
-                exec_sql(
-                    """
-                    INSERT INTO faturas (conta_id,competencia,dt_inicio,dt_fim,dt_fechamento,dt_vencimento,status)
-                    VALUES (%s,%s,%s,%s,%s,%s,'ABERTA')
-                    ON CONFLICT (conta_id, competencia) DO UPDATE
-                    SET dt_inicio=EXCLUDED.dt_inicio,
-                        dt_fim=EXCLUDED.dt_fim,
-                        dt_fechamento=EXCLUDED.dt_fechamento,
-                        dt_vencimento=EXCLUDED.dt_vencimento
-                    """,
-                    [cartao_id, competencia.isoformat(), dt_inicio.isoformat(), dt_fim.isoformat(), dt_fech.isoformat(), dt_venc.isoformat()],
-                )
-                toast_ok("Fatura salva")
-                st.rerun()
-
-        st.markdown("#### Lista de faturas")
-        dff = list_faturas(cartao_id)
-        if dff.empty:
-            st.info("Nenhuma fatura cadastrada para esse cartão.")
+        if qtd > 0:
+            st.warning(f"Esta fatura possui {qtd} lançamento(s) vinculado(s). Exclua/ajuste os lançamentos primeiro.")
         else:
-            dff_show = dff.copy()
-            for col in ["competencia","dt_inicio","dt_fim","dt_fechamento","dt_vencimento"]:
-                dff_show[col] = pd.to_datetime(dff_show[col]).dt.strftime("%d/%m/%Y")
-            st.dataframe(dff_show, use_container_width=True, hide_index=True)
+            confirm = st.checkbox("Confirmo que quero excluir esta fatura", key="fat_del_confirm")
+            if st.button("Excluir fatura", type="primary", use_container_width=True, key="fat_del_btn"):
+                if not confirm:
+                    st.error("Marque a confirmação.")
+                else:
+                    exec_sql("DELETE FROM faturas WHERE id=%s", [int(fatura_id)])
+                    clear_cache()
+                    st.toast("Fatura excluída", icon="✅")
+                    st.session_state.pop("fat_del_id", None)
+                    st.session_state.pop("fat_del_confirm", None)
+                    st.rerun()
+
+        st.divider()
+
+        contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
+        if contas_cartao.empty:
+            st.info("Cadastre pelo menos 1 cartão em Contas.")
+        else:
+            cartao_nome = st.selectbox("Cartão", contas_cartao["nome"].tolist(), key="f_cartao")
+            cartao_id = int(contas_cartao.loc[contas_cartao["nome"] == cartao_nome, "id"].iloc[0])
+
+            st.markdown("#### Criar/Atualizar fatura do mês")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1:
+                competencia = st.date_input("Competência (dia 01)", value=month_start(date.today()), key="f_comp")
+                competencia = month_start(competencia)
+            with c2:
+                dt_inicio = st.date_input("Início", value=(competencia - relativedelta(months=1) + relativedelta(days=2)), key="f_ini")
+            with c3:
+                dt_fim = st.date_input("Fim", value=(competencia + relativedelta(days=1)), key="f_fim")
+            with c4:
+                dt_fech = st.date_input("Fechamento", value=dt_fim, key="f_fech")
+            with c5:
+                dt_venc = st.date_input("Vencimento", value=(competencia + relativedelta(days=24)), key="f_venc")
+
+            if st.button("Salvar fatura", type="primary", use_container_width=True, key="f_save"):
+                if dt_inicio > dt_fim:
+                    st.error("Início não pode ser maior que Fim.")
+                else:
+                    exec_sql(
+                        """
+                        INSERT INTO faturas (conta_id,competencia,dt_inicio,dt_fim,dt_fechamento,dt_vencimento,status)
+                        VALUES (%s,%s,%s,%s,%s,%s,'ABERTA')
+                        ON CONFLICT (conta_id, competencia) DO UPDATE
+                        SET dt_inicio=EXCLUDED.dt_inicio,
+                            dt_fim=EXCLUDED.dt_fim,
+                            dt_fechamento=EXCLUDED.dt_fechamento,
+                            dt_vencimento=EXCLUDED.dt_vencimento
+                        """,
+                        [cartao_id, competencia.isoformat(), dt_inicio.isoformat(), dt_fim.isoformat(), dt_fech.isoformat(), dt_venc.isoformat()],
+                    )
+                    toast_ok("Fatura salva")
+                    st.rerun()
+
+            st.markdown("#### Lista de faturas")
+            dff = list_faturas(cartao_id)
+            if dff.empty:
+                st.info("Nenhuma fatura cadastrada para esse cartão.")
+            else:
+                dff_show = dff.copy()
+                for col in ["competencia","dt_inicio","dt_fim","dt_fechamento","dt_vencimento"]:
+                    dff_show[col] = pd.to_datetime(dff_show[col]).dt.strftime("%d/%m/%Y")
+                st.dataframe(dff_show, use_container_width=True, hide_index=True)
 
 # ---------------- Lançamentos ----------------
 with tabs[3]:
