@@ -281,19 +281,66 @@ def total_fatura(fatura_id: int) -> float:
     """, [int(fatura_id)])
     return float(row["total"]) if row else 0.0
 
-def saldo_cora() -> float:
-    row = fetch_one("""
-      SELECT
-        c.saldo_inicial::float8
-        + COALESCE(SUM(CASE WHEN l.tipo='RECEITA' THEN l.valor ELSE 0 END),0)::float8
-        - COALESCE(SUM(CASE WHEN l.tipo='DESPESA' THEN l.valor ELSE 0 END),0)::float8
-        AS saldo
-      FROM contas c
-      LEFT JOIN lancamentos l ON l.conta_id = c.id
-      WHERE c.nome='Cora'
-      GROUP BY c.saldo_inicial
-    """)
+def saldo_conta_real(conta_nome: str) -> float:
+    """Saldo REAL da conta (impacta caixa): só considera lançamentos liquidados.
+    - RECEITA entra no saldo quando status='Recebido' OU dt_liquidacao preenchida
+    - DESPESA sai do saldo quando status='Pago' OU dt_liquidacao preenchida
+    """
+    row = fetch_one(
+        """
+        SELECT
+            c.saldo_inicial::float8
+            + COALESCE(SUM(CASE
+                WHEN l.tipo='RECEITA'
+                 AND (COALESCE(l.status,'Pendente') ILIKE 'recebido' OR l.dt_liquidacao IS NOT NULL)
+                THEN l.valor ELSE 0 END),0)::float8
+            - COALESCE(SUM(CASE
+                WHEN l.tipo='DESPESA'
+                 AND (COALESCE(l.status,'Pendente') ILIKE 'pago' OR l.dt_liquidacao IS NOT NULL)
+                THEN l.valor ELSE 0 END),0)::float8
+          AS saldo
+        FROM contas c
+        LEFT JOIN lancamentos l ON l.conta_id = c.id
+        WHERE c.nome = %s
+        GROUP BY c.saldo_inicial
+        """,
+        [conta_nome],
+    )
     return float(row["saldo"]) if row else 0.0
+
+def previsao_receber_conta(conta_nome: str) -> float:
+    """Previsão de RECEBIMENTO (receitas pendentes) - não entra no saldo real."""
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(l.valor),0)::float8 AS total
+          FROM contas c
+          JOIN lancamentos l ON l.conta_id = c.id
+         WHERE c.nome=%s
+           AND l.tipo='RECEITA'
+           AND COALESCE(l.status,'Pendente') ILIKE 'pendente'
+        """,
+        [conta_nome],
+    )
+    return float(row["total"]) if row else 0.0
+
+def previsao_pagar_conta(conta_nome: str) -> float:
+    """Previsão de PAGAMENTO (despesas pendentes) - não sai do saldo real."""
+    row = fetch_one(
+        """
+        SELECT COALESCE(SUM(l.valor),0)::float8 AS total
+          FROM contas c
+          JOIN lancamentos l ON l.conta_id = c.id
+         WHERE c.nome=%s
+           AND l.tipo='DESPESA'
+           AND COALESCE(l.status,'Pendente') ILIKE 'pendente'
+        """,
+        [conta_nome],
+    )
+    return float(row["total"]) if row else 0.0
+
+def saldo_cora() -> float:
+    return saldo_conta_real("Cora")
+
 
 def suggest_fatura_for_date(cartao_id: int, dt: date) -> Optional[int]:
     row = fetch_one("""
@@ -326,7 +373,8 @@ st.markdown(
 # KPIs topo
 colA, colB, colC = st.columns(3)
 with colA:
-    st.metric("Saldo Cora (R$)", br_money(saldo_cora()))
+    st.metric("Saldo Cora (REAL) (R$)", br_money(saldo_cora()))
+    st.caption(f"Previsão a receber: {br_money(previsao_receber_conta('Cora'))} • a pagar: {br_money(previsao_pagar_conta('Cora'))}")
 with colB:
     # Próximas faturas a pagar (total aberto/fechado não pago)
     df_next = fetch_df("""
@@ -1278,7 +1326,7 @@ with tabs[6]:
       FROM lancamentos l
       JOIN contas c ON c.id=l.conta_id
       LEFT JOIN categorias cat ON cat.id=l.categoria_id
-      WHERE l.dt_competencia BETWEEN %s AND %s    
+      WHERE l.dt_competencia BETWEEN %s AND %s
     """, [ini.isoformat(), fim.isoformat()])
 
     if df.empty:
@@ -1304,5 +1352,6 @@ with tabs[6]:
         piv = df_day.pivot_table(index="dia", columns="tipo", values="valor", aggfunc="sum", fill_value=0).reset_index()
         st.dataframe(piv, use_container_width=True, hide_index=True)
 
-        st.markdown("### Saldo Cora (agora)")
-        st.metric("Saldo Cora (R$)", br_money(saldo_cora()))
+        st.markdown("### Saldo Cora (caixa real)")
+        st.metric("Saldo Cora (REAL) (R$)", br_money(saldo_cora()))
+        st.caption(f"Previsão a receber: {br_money(previsao_receber_conta('Cora'))} • a pagar: {br_money(previsao_pagar_conta('Cora'))}")
