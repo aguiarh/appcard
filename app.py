@@ -349,9 +349,42 @@ tabs = st.tabs(["🏦 Contas", "🧾 Faturas", "➕ Lançamentos", "💳 Fechame
 # ---------------- Contas ----------------
 with tabs[0]:
     st.subheader("Contas")
-    dfc = list_contas(only_active=False)
-    st.dataframe(dfc, use_container_width=True, hide_index=True)
+    st.caption("Dica: saldo inicial é usado só para CONTA (ex: Cora). Para cartões, deixe 0,00.")
 
+    dfc = list_contas(only_active=False)
+    if dfc.empty:
+        st.info("Nenhuma conta cadastrada.")
+    else:
+        st.markdown("### Ajustar contas (saldo inicial / ativar-desativar)")
+        df_edit = dfc.copy()
+        df_edit = df_edit[["id", "nome", "tipo", "saldo_inicial", "ativo"]]
+        df_edit["saldo_inicial"] = df_edit["saldo_inicial"].fillna(0.0).astype(float)
+
+        edited = st.data_editor(
+            df_edit,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id", "nome", "tipo"],
+            column_config={
+                "saldo_inicial": st.column_config.NumberColumn("Saldo inicial", help="Apenas para contas do tipo CONTA", format="%.2f"),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+            },
+            key="contas_editor",
+        )
+
+        c1, c2 = st.columns([0.35, 0.65])
+        with c1:
+            if st.button("Salvar alterações", type="primary", use_container_width=True, key="contas_save"):
+                rows = []
+                for _, r in edited.iterrows():
+                    rows.append((float(r["saldo_inicial"]), bool(r["ativo"]), int(r["id"])))
+                exec_many("UPDATE contas SET saldo_inicial=%s, ativo=%s WHERE id=%s", rows)
+                toast_ok("Contas atualizadas", 2)
+                st.rerun()
+        with c2:
+            st.info("Se o saldo do Cora parecer errado, confirme: saldo inicial + receitas - despesas.")
+
+    st.divider()
     st.markdown("### Nova conta/cartão")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -360,6 +393,7 @@ with tabs[0]:
         tipo = st.selectbox("Tipo", ["CONTA", "CARTAO"], key="c_tipo")
     with c3:
         saldo_ini = st.text_input("Saldo inicial (apenas CONTA)", value="0,00", key="c_saldo")
+
     if st.button("Adicionar", type="primary", use_container_width=True, key="c_add"):
         if not nome.strip():
             st.error("Informe o nome.")
@@ -434,9 +468,11 @@ with tabs[2]:
     if contas.empty:
         st.info("Cadastre contas primeiro.")
     else:
+        st.markdown("### Novo lançamento")
+
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            tipo_l = st.selectbox("Tipo", ["DESPESA","RECEITA"], key="l_tipo")
+            tipo_l = st.selectbox("Tipo", ["DESPESA", "RECEITA"], key="l_tipo")
         with c2:
             conta_nome = st.selectbox("Conta", contas["nome"].tolist(), key="l_conta")
             conta_row = contas.loc[contas["nome"] == conta_nome].iloc[0]
@@ -445,9 +481,10 @@ with tabs[2]:
         with c3:
             dt_comp = st.date_input("Data (competência)", value=date.today(), key="l_dt")
         with c4:
-            valor_txt = st.text_input("Valor (R$)", value="0,00", key="l_valor")
+            parcelas = st.number_input("Parcelas", min_value=1, max_value=60, value=1, step=1, key="l_parc")
 
         desc = st.text_input("Descrição", key="l_desc")
+
         c5, c6, c7 = st.columns(3)
         with c5:
             cat_nome = st.selectbox("Categoria", cats["nome"].tolist(), key="l_cat")
@@ -457,15 +494,20 @@ with tabs[2]:
         with c7:
             status = st.text_input("Status (opcional)", value="", key="l_status")
 
+        modo_valor = st.radio("Valor informado é", ["Total", "Parcela"], horizontal=True, key="l_modo_valor")
+        if modo_valor == "Total":
+            valor_txt = st.text_input("Valor total (R$)", value="0,00", key="l_valor_total")
+        else:
+            valor_txt = st.text_input("Valor da parcela (R$)", value="0,00", key="l_valor_parcela")
+
         fatura_id: Optional[int] = None
         if conta_tipo == "CARTAO" and tipo_l == "DESPESA":
-            st.markdown("##### Fatura")
+            st.markdown("##### Fatura (para compras no cartão)")
             suggested = suggest_fatura_for_date(conta_id, dt_comp)
             dff = list_faturas(conta_id)
             if dff.empty:
                 st.warning("Cadastre a fatura desse cartão na aba Faturas para vincular as compras.")
             else:
-                # build options
                 opts = []
                 for _, r in dff.iterrows():
                     label = f"{r['cartao']} • {pd.to_datetime(r['competencia']).strftime('%m/%Y')} • vence {pd.to_datetime(r['dt_vencimento']).strftime('%d/%m/%Y')} • {r['status']}"
@@ -476,58 +518,140 @@ with tabs[2]:
                         if fid == suggested:
                             default_idx = i
                             break
-                choice = st.selectbox("Vincular à fatura", options=list(range(len(opts))), format_func=lambda i: opts[i][1], index=default_idx, key="l_fatura_sel")
+                choice = st.selectbox(
+                    "Vincular à fatura (1ª parcela)",
+                    options=list(range(len(opts))),
+                    format_func=lambda i: opts[i][1],
+                    index=default_idx,
+                    key="l_fatura_sel",
+                )
                 fatura_id = opts[choice][0]
 
         dt_liq = st.date_input("Data liquidação (opcional)", value=None, key="l_dtliq")
 
-        if st.button("Salvar lançamento", type="primary", use_container_width=True, key="l_save"):
-            erros: List[str] = []
+        def _calc_valores_parcelas(v_in: float, n: int, modo: str):
+            if n <= 1:
+                return [round(v_in, 2)]
+            if modo == "Total":
+                base = round(v_in / n, 2)
+                vals = [base] * n
+                vals[-1] = round(vals[-1] + (v_in - sum(vals)), 2)
+                return vals
+            return [round(v_in, 2)] * n
+
+        if st.button("Gerar prévia", use_container_width=True, key="l_previa"):
+            erros = []
             if not desc.strip():
                 erros.append("Descrição obrigatória.")
             v = parse_brl(valor_txt)
             if v <= 0:
                 erros.append("Valor deve ser maior que 0.")
+            if tipo_l == "RECEITA" and int(parcelas) != 1:
+                erros.append("Receita parcelada: por enquanto use parcelas = 1 (podemos evoluir depois).")
             if conta_tipo == "CARTAO" and tipo_l == "DESPESA" and not fatura_id:
                 erros.append("Selecione uma fatura para compras no cartão.")
             if erros:
                 st.error("Ajuste:\n\n- " + "\n- ".join(erros))
             else:
-                exec_sql(
-                    """
-                    INSERT INTO lancamentos
-                      (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status)
-                    VALUES
-                      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    [
-                        tipo_l,
-                        desc.strip(),
-                        float(v),
-                        dt_comp.isoformat(),
-                        (dt_liq.isoformat() if dt_liq else None),
-                        conta_id,
-                        fatura_id,
-                        cat_id,
-                        (forma or None),
-                        (status or None),
-                    ],
-                )
-                toast_ok("Lançamento salvo")
-                st.rerun()
+                vals = _calc_valores_parcelas(v, int(parcelas), modo_valor)
+                linhas = []
+                for i in range(int(parcelas)):
+                    dt_i = dt_comp + relativedelta(months=i)
+                    fat_i = None
+                    if conta_tipo == "CARTAO" and tipo_l == "DESPESA":
+                        fat_i = suggest_fatura_for_date(conta_id, dt_i)
+                    linhas.append({
+                        "tipo": tipo_l,
+                        "descricao": desc.strip(),
+                        "valor": float(vals[i]),
+                        "dt_competencia": dt_i,
+                        "dt_liquidacao": dt_liq,
+                        "conta_id": conta_id,
+                        "fatura_id": fat_i,
+                        "categoria_id": cat_id,
+                        "forma_pagamento": (forma or None),
+                        "status": (status or None),
+                        "prestacao": (f"{i+1}/{int(parcelas)}" if int(parcelas) > 1 else None),
+                    })
+                st.session_state["l_prev_df"] = pd.DataFrame(linhas)
+
+        prev = st.session_state.get("l_prev_df")
+        if isinstance(prev, pd.DataFrame) and not prev.empty:
+            st.markdown("### Prévia (edite se quiser antes de salvar)")
+            view = prev.copy()
+            view["valor"] = view["valor"].apply(br_money)
+            view["dt_competencia"] = pd.to_datetime(view["dt_competencia"]).dt.date
+
+            edited = st.data_editor(
+                view,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["tipo", "conta_id", "categoria_id"],
+                column_config={
+                    "valor": st.column_config.TextColumn("Valor (R$)"),
+                    "dt_competencia": st.column_config.DateColumn("Data competência"),
+                    "dt_liquidacao": st.column_config.DateColumn("Data liquidação"),
+                    "fatura_id": st.column_config.NumberColumn("Fatura ID (auto)"),
+                },
+                key="l_prev_editor",
+            )
+
+            csa, csb = st.columns(2)
+            with csa:
+                if st.button("Salvar lançamento(s)", type="primary", use_container_width=True, key="l_save_multi"):
+                    rows = []
+                    erros = []
+                    for _, r in edited.iterrows():
+                        try:
+                            rows.append((
+                                r["tipo"],
+                                r["descricao"],
+                                float(parse_brl(r["valor"])),
+                                pd.to_datetime(r["dt_competencia"]).date().isoformat(),
+                                (pd.to_datetime(r["dt_liquidacao"]).date().isoformat() if r.get("dt_liquidacao") else None),
+                                int(r["conta_id"]),
+                                (int(r["fatura_id"]) if r.get("fatura_id") not in (None, "", 0) else None),
+                                int(r["categoria_id"]),
+                                r.get("forma_pagamento", None),
+                                r.get("status", None),
+                                r.get("prestacao", None),
+                            ))
+                        except Exception as e:
+                            erros.append(str(e))
+
+                    if erros:
+                        st.error("Falha ao preparar dados:\n- " + "\n- ".join(erros))
+                    else:
+                        exec_many(
+                            """
+                            INSERT INTO lancamentos
+                              (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status,prestacao)
+                            VALUES
+                              (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            """,
+                            rows,
+                        )
+                        st.session_state.pop("l_prev_df", None)
+                        toast_ok("Lançamento(s) salvo(s)", 2)
+                        st.rerun()
+            with csb:
+                if st.button("Limpar prévia", use_container_width=True, key="l_clear_prev"):
+                    st.session_state.pop("l_prev_df", None)
+                    st.rerun()
 
         st.divider()
         st.markdown("### Listagem")
         filtro = st.text_input("Buscar (descrição)", value="", key="l_busca")
         conta_f = st.selectbox("Filtrar por conta", ["Todas"] + contas["nome"].tolist(), key="l_fconta")
         where = "WHERE 1=1"
-        params: List[Any] = []
+        params = []
         if filtro.strip():
-            where += " AND descricao ILIKE %s"
+            where += " AND l.descricao ILIKE %s"
             params.append(f"%{filtro.strip()}%")
         if conta_f != "Todas":
-            where += " AND conta_id = (SELECT id FROM contas WHERE nome=%s)"
+            where += " AND l.conta_id = (SELECT id FROM contas WHERE nome=%s)"
             params.append(conta_f)
+
         df = fetch_df(f"""
           SELECT l.id,
                  l.tipo,
@@ -536,22 +660,22 @@ with tabs[2]:
                  l.dt_competencia,
                  c.nome AS conta,
                  COALESCE(cat.nome,'') AS categoria,
-                 COALESCE(f.id,0) AS fatura_id
+                 COALESCE(l.prestacao,'') AS prestacao
           FROM lancamentos l
           JOIN contas c ON c.id=l.conta_id
           LEFT JOIN categorias cat ON cat.id=l.categoria_id
-          LEFT JOIN faturas f ON f.id=l.fatura_id
           {where}
           ORDER BY l.dt_competencia DESC, l.id DESC
-          LIMIT 400
+          LIMIT 600
         """, params)
+
         if df.empty:
             st.info("Nada para mostrar.")
         else:
             df_show = df.copy()
             df_show["dt_competencia"] = pd.to_datetime(df_show["dt_competencia"]).dt.strftime("%d/%m/%Y")
             df_show["valor"] = df_show["valor"].apply(br_money)
-            st.dataframe(df_show.drop(columns=["fatura_id"]), use_container_width=True, hide_index=True)
+            st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 # ---------------- Fechamento ----------------
 with tabs[3]:
