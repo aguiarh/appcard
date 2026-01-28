@@ -344,7 +344,7 @@ with colB:
 with colC:
     st.metric("Hoje", date.today().strftime("%d/%m/%Y"))
 
-tabs = st.tabs(["🏦 Contas", "🧾 Faturas", "➕ Lançamentos", "💳 Fechamento", "📊 BI"])
+tabs = st.tabs(["🏦 Contas", "🏷️ Categorias", "🧾 Faturas", "➕ Lançamentos", "💳 Fechamento", "📊 BI"])
 
 # ---------------- Contas ----------------
 with tabs[0]:
@@ -406,8 +406,52 @@ with tabs[0]:
             toast_ok("Conta criada")
             st.rerun()
 
-# ---------------- Faturas ----------------
+# ---------------- Categorias ----------------
 with tabs[1]:
+    st.subheader("Categorias")
+    st.caption("Cadastre e organize suas categorias. Você pode desativar sem apagar histórico.")
+
+    df_cat = fetch_df("SELECT id, nome, ativo FROM categorias ORDER BY nome")
+    if df_cat.empty:
+        st.info("Nenhuma categoria cadastrada.")
+    else:
+        st.markdown("### Editar categorias")
+        edited = st.data_editor(
+            df_cat,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id"],
+            column_config={
+                "nome": st.column_config.TextColumn("Nome"),
+                "ativo": st.column_config.CheckboxColumn("Ativo"),
+            },
+            key="cat_editor",
+        )
+        c1, c2 = st.columns([0.35, 0.65])
+        with c1:
+            if st.button("Salvar categorias", type="primary", use_container_width=True, key="cat_save"):
+                rows = []
+                for _, r in edited.iterrows():
+                    rows.append((str(r["nome"]).strip(), bool(r["ativo"]), int(r["id"])))
+                exec_many("UPDATE categorias SET nome=%s, ativo=%s WHERE id=%s", rows)
+                toast_ok("Categorias atualizadas", 2)
+                st.rerun()
+        with c2:
+            st.info("Dica: desativar mantém os lançamentos antigos intactos.")
+
+    st.divider()
+    st.markdown("### Nova categoria")
+    nova = st.text_input("Nome da categoria", key="cat_new_name")
+    if st.button("Adicionar categoria", type="primary", use_container_width=True, key="cat_add"):
+        if not (nova or "").strip():
+            st.error("Informe um nome.")
+        else:
+            exec_sql("INSERT INTO categorias (nome) VALUES (%s) ON CONFLICT (nome) DO NOTHING", [nova.strip()])
+            toast_ok("Categoria criada", 2)
+            st.rerun()
+
+# ---------------- Faturas ----------------
+with tabs[2]:
     st.subheader("Faturas (datas reais por mês)")
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
@@ -460,7 +504,7 @@ with tabs[1]:
             st.dataframe(dff_show, use_container_width=True, hide_index=True)
 
 # ---------------- Lançamentos ----------------
-with tabs[2]:
+with tabs[3]:
     st.subheader("Lançamentos (Receitas e Despesas)")
     contas = list_contas(only_active=True)
     cats = list_categorias()
@@ -492,7 +536,7 @@ with tabs[2]:
         with c6:
             forma = st.text_input("Forma (opcional)", value="", key="l_forma")
         with c7:
-            status = st.text_input("Status (opcional)", value="", key="l_status")
+            status = st.text_input("Status", value="Pendente", key="l_status")
 
         modo_valor = st.radio("Valor informado é", ["Total", "Parcela"], horizontal=True, key="l_modo_valor")
         if modo_valor == "Total":
@@ -677,8 +721,194 @@ with tabs[2]:
             df_show["valor"] = df_show["valor"].apply(br_money)
             st.dataframe(df_show, use_container_width=True, hide_index=True)
 
+            st.divider()
+            st.markdown("## ✏️ Editar / Excluir lançamentos")
+            st.caption("Use o ID da linha. Dá pra corrigir fatura, datas, valores e status. Excluir apaga a linha (cuidado).")
+
+            with st.expander("Editar um lançamento por ID", expanded=False):
+                edit_id = st.number_input("ID do lançamento", min_value=1, step=1, value=1, key="edit_lanc_id")
+                if st.button("Carregar", use_container_width=True, key="edit_lanc_load"):
+                    row = fetch_one(
+                        """
+                        SELECT id, tipo, descricao, valor::float8 AS valor, dt_competencia, dt_liquidacao,
+                               conta_id, fatura_id, categoria_id, forma_pagamento, status, prestacao
+                        FROM lancamentos WHERE id=%s
+                        """,
+                        [int(edit_id)],
+                    )
+                    st.session_state["edit_row"] = row
+
+                row = st.session_state.get("edit_row")
+                if row and int(row.get("id", 0)) == int(edit_id):
+                    contas_all = list_contas(only_active=False)
+                    cats_all = fetch_df("SELECT id, nome FROM categorias ORDER BY nome")
+
+                    conta_map = {int(r["id"]): f'{r["nome"]} ({r["tipo"]})' for _, r in contas_all.iterrows()}
+                    cat_map = {int(r["id"]): r["nome"] for _, r in cats_all.iterrows()}
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        e_tipo = st.selectbox("Tipo", ["RECEITA", "DESPESA"], index=0 if row["tipo"]=="RECEITA" else 1, key="e_tipo")
+                    with c2:
+                        keys = list(conta_map.keys())
+                        e_conta = st.selectbox("Conta", options=keys, format_func=lambda k: conta_map[k],
+                                               index=(keys.index(int(row["conta_id"])) if int(row["conta_id"]) in keys else 0),
+                                               key="e_conta")
+                    with c3:
+                        cat_keys = list(cat_map.keys()) if cat_map else []
+                        e_cat = st.selectbox("Categoria", options=cat_keys, format_func=lambda k: cat_map[k],
+                                             index=(cat_keys.index(int(row["categoria_id"])) if row["categoria_id"] and int(row["categoria_id"]) in cat_keys else 0),
+                                             key="e_cat")
+
+                    e_desc = st.text_input("Descrição", value=row["descricao"] or "", key="e_desc")
+                    e_val = st.text_input("Valor (R$)", value=br_money(row["valor"]), key="e_val")
+                    c4, c5, c6 = st.columns(3)
+                    with c4:
+                        e_dt = st.date_input("Data competência", value=pd.to_datetime(row["dt_competencia"]).date(), key="e_dt")
+                    with c5:
+                        e_dtliq = st.date_input("Data liquidação (receb/pag)", value=(pd.to_datetime(row["dt_liquidacao"]).date() if row["dt_liquidacao"] else None), key="e_dtliq")
+                    with c6:
+                        e_status = st.text_input("Status", value=(row["status"] or "Pendente"), key="e_status")
+
+                    st.markdown("#### Fatura (opcional)")
+                    e_fatura_in = st.text_input("Fatura ID (vazio remove)", value=("" if not row.get("fatura_id") else str(row.get("fatura_id"))), key="e_fatura")
+
+                    e_forma = st.text_input("Forma (opcional)", value=row.get("forma_pagamento") or "", key="e_forma")
+                    e_prest = st.text_input("Prestação (opcional)", value=row.get("prestacao") or "", key="e_prest")
+
+                    if st.button("Salvar edição", type="primary", use_container_width=True, key="edit_lanc_save"):
+                        v = parse_brl(e_val)
+                        if v <= 0:
+                            st.error("Valor inválido.")
+                        else:
+                            fat = (e_fatura_in or "").strip()
+                            fat_id = int(fat) if fat.isdigit() else None
+                            exec_sql(
+                                """
+                                UPDATE lancamentos
+                                   SET tipo=%s,
+                                       descricao=%s,
+                                       valor=%s,
+                                       dt_competencia=%s,
+                                       dt_liquidacao=%s,
+                                       conta_id=%s,
+                                       fatura_id=%s,
+                                       categoria_id=%s,
+                                       forma_pagamento=%s,
+                                       status=%s,
+                                       prestacao=%s
+                                 WHERE id=%s
+                                """,
+                                [
+                                    e_tipo,
+                                    e_desc.strip(),
+                                    float(v),
+                                    e_dt.isoformat(),
+                                    (e_dtliq.isoformat() if e_dtliq else None),
+                                    int(e_conta),
+                                    fat_id,
+                                    (int(e_cat) if e_cat else None),
+                                    (e_forma.strip() or None),
+                                    (e_status.strip() or None),
+                                    (e_prest.strip() or None),
+                                    int(edit_id),
+                                ],
+                            )
+                            toast_ok("Lançamento atualizado", 2)
+                            st.session_state.pop("edit_row", None)
+                            st.rerun()
+
+            with st.expander("Excluir lançamento por ID", expanded=False):
+                del_id = st.number_input("ID para excluir", min_value=1, step=1, value=1, key="del_lanc_id")
+                confirm = st.checkbox("Confirmo exclusão definitiva", key="del_confirm")
+                if st.button("Excluir", type="primary", use_container_width=True, key="del_lanc_btn"):
+                    if not confirm:
+                        st.error("Marque a confirmação para excluir.")
+                    else:
+                        exec_sql("DELETE FROM lancamentos WHERE id=%s", [int(del_id)])
+                        toast_ok("Lançamento excluído", 2)
+                        st.rerun()
+
+            st.divider()
+            st.markdown("## 📦 Baixa em lote (ótimo para boletos)")
+            st.caption("Crie várias RECEITAS com status Pendente e depois dê baixa em uma única data.")
+
+            with st.expander("Dar baixa em lote (por IDs)", expanded=False):
+                ids_txt = st.text_input("IDs (separados por vírgula)", value="", key="batch_ids")
+                dt_baixa = st.date_input("Data de baixa (liquidação)", value=date.today(), key="batch_dt")
+                novo_status = st.selectbox("Novo status", ["Recebido", "Pago", "Cancelado", "Pendente"], index=0, key="batch_status")
+
+                if st.button("Aplicar baixa", type="primary", use_container_width=True, key="batch_apply"):
+                    ids = []
+                    for p in (ids_txt or "").split(","):
+                        p = p.strip()
+                        if p.isdigit():
+                            ids.append(int(p))
+                    if not ids:
+                        st.error("Informe pelo menos um ID válido.")
+                    else:
+                        exec_sql(
+                            "UPDATE lancamentos SET dt_liquidacao=%s, status=%s WHERE id = ANY(%s)",
+                            [dt_baixa.isoformat(), novo_status, ids],
+                        )
+                        toast_ok("Baixa aplicada", 2)
+                        st.rerun()
+
+            with st.expander("Gerar várias RECEITAS pendentes (ex: boletos)", expanded=False):
+                n = st.number_input("Quantidade", min_value=1, max_value=200, value=5, step=1, key="lot_rec_n")
+                desc_base = st.text_input("Descrição base", value="Boleto", key="lot_rec_desc")
+                dt_prev = st.date_input("Data prevista (competência)", value=date.today(), key="lot_rec_dt")
+                v_txt = st.text_input("Valor (R$) de cada", value="0,00", key="lot_rec_val")
+
+                contas_all = list_contas(only_active=True)
+                conta_ids = contas_all.loc[contas_all["tipo"]=="CONTA", "id"].tolist()
+                if not conta_ids:
+                    st.error("Cadastre pelo menos uma CONTA (ex: Cora).")
+                else:
+                    conta_sel = st.selectbox("Conta (recebimento)", options=conta_ids,
+                                             format_func=lambda k: contas_all.loc[contas_all["id"]==k, "nome"].iloc[0],
+                                             key="lot_rec_conta")
+
+                    cat_df = fetch_df("SELECT id, nome FROM categorias WHERE ativo=TRUE ORDER BY nome")
+                    cat_choice = st.selectbox("Categoria", options=cat_df["id"].tolist(),
+                                              format_func=lambda k: cat_df.loc[cat_df["id"]==k, "nome"].iloc[0],
+                                              key="lot_rec_cat") if not cat_df.empty else None
+
+                    if st.button("Gerar receitas", type="primary", use_container_width=True, key="lot_rec_go"):
+                        v = parse_brl(v_txt)
+                        if v <= 0:
+                            st.error("Valor inválido.")
+                        else:
+                            rows = []
+                            for i in range(int(n)):
+                                rows.append((
+                                    "RECEITA",
+                                    f"{desc_base.strip()} #{i+1}",
+                                    float(v),
+                                    dt_prev.isoformat(),
+                                    None,
+                                    int(conta_sel),
+                                    None,
+                                    int(cat_choice) if cat_choice else None,
+                                    None,
+                                    "Pendente",
+                                    None
+                                ))
+                            exec_many(
+                                """
+                                INSERT INTO lancamentos
+                                  (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status,prestacao)
+                                VALUES
+                                  (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                                """,
+                                rows,
+                            )
+                            toast_ok("Receitas pendentes geradas", 2)
+                            st.rerun()
+
+
 # ---------------- Fechamento ----------------
-with tabs[3]:
+with tabs[4]:
     st.subheader("Fechamento e Pagamento de Faturas")
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
@@ -809,7 +1039,7 @@ with tabs[3]:
                 st.dataframe(df_it, use_container_width=True, hide_index=True)
 
 # ---------------- BI ----------------
-with tabs[4]:
+with tabs[5]:
     st.subheader("BI do mês (Receitas x Despesas + por categoria)")
     contas = list_contas(only_active=True)
     mes_ref = st.date_input("Mês de referência", value=month_start(date.today()), key="bi_mes")
