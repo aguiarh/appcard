@@ -605,6 +605,60 @@ with tabs[2]:
 
     st.divider()
 
+st.markdown("### Excluir fatura")
+st.caption("Regra: só permite excluir se não existir nenhum lançamento vinculado a ela.")
+
+df_fat_del = fetch_df(
+    """
+    SELECT f.id,
+           c.nome AS cartao,
+           f.competencia,
+           f.dt_inicio,
+           f.dt_fim,
+           f.dt_vencimento,
+           f.status
+      FROM faturas f
+      JOIN contas c ON c.id = f.conta_id
+     ORDER BY c.nome, f.competencia DESC
+    """
+)
+
+if df_fat_del.empty:
+    st.info("Nenhuma fatura para excluir.")
+else:
+    # Monta label amigável (sem expor ID)
+    df_lbl = df_fat_del.copy()
+    df_lbl["competencia"] = pd.to_datetime(df_lbl["competencia"]).dt.strftime("%m/%Y")
+    df_lbl["dt_vencimento"] = pd.to_datetime(df_lbl["dt_vencimento"]).dt.strftime("%d/%m/%Y")
+    df_lbl["label"] = df_lbl["cartao"].astype(str) + " • " + df_lbl["competencia"] + " • Venc: " + df_lbl["dt_vencimento"] + " • " + df_lbl["status"].astype(str)
+
+    fatura_id = st.selectbox(
+        "Selecione a fatura",
+        options=df_lbl["id"].tolist(),
+        format_func=lambda k: df_lbl.loc[df_lbl["id"] == k, "label"].iloc[0],
+        key="fat_del_id",
+    )
+
+    row_cnt = fetch_one("SELECT COUNT(*)::int AS qtd FROM lancamentos WHERE fatura_id=%s", [int(fatura_id)])
+    qtd = int(row_cnt["qtd"]) if row_cnt else 0
+
+    if qtd > 0:
+        st.warning(f"Esta fatura possui {qtd} lançamento(s) vinculado(s). Exclua/ajuste os lançamentos primeiro.")
+    else:
+        confirm = st.checkbox("Confirmo que quero excluir esta fatura", key="fat_del_confirm")
+        if st.button("Excluir fatura", type="primary", use_container_width=True, key="fat_del_btn"):
+            if not confirm:
+                st.error("Marque a confirmação.")
+            else:
+                exec_sql("DELETE FROM faturas WHERE id=%s", [int(fatura_id)])
+                clear_cache()
+                st.toast("Fatura excluída", icon="✅")
+                st.session_state.pop("fat_del_id", None)
+                st.session_state.pop("fat_del_confirm", None)
+                st.rerun()
+
+    st.divider()
+
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
         st.info("Cadastre pelo menos 1 cartão em Contas.")
