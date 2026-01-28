@@ -235,6 +235,24 @@ def fetch_one(sql: str, params: Optional[List[Any]] = None) -> Optional[Dict[str
             row = cur.fetchone()
             return dict(row) if row else None
 
+@st.cache_data(ttl=30, show_spinner=False)
+def cached_df(query: str, params: tuple = ()) -> pd.DataFrame:
+    """Cache simples para reduzir reruns lentos ao mexer em filtros/widgets."""
+    return fetch_df(query, list(params) if params else None)
+
+def cached_one(query: str, params: tuple = ()):
+    rows = cached_df(query, params)
+    if rows is None or len(rows) == 0:
+        return None
+    return rows.iloc[0].to_dict()
+
+def clear_cache():
+    try:
+        cached_df.clear()
+    except Exception:
+        pass
+
+
 def exec_sql(sql: str, params: Optional[List[Any]] = None) -> None:
     params = params or []
     with get_conn() as conn:
@@ -1052,12 +1070,12 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("Boletos (Agrupar receitas)")
     st.caption(
-        "Selecione receitas PENDENTES já lançadas e gere um único boleto com vencimento futuro. "
-        "O boleto é criado como uma nova RECEITA Pendente. As receitas agrupadas ficam com status 'Agrupada'."
+        "Aqui você lista todas as receitas pendentes (com filtros) e marca (checkbox) quais quer agrupar em um único boleto. "
+        "O saldo da conta só muda quando estiver Recebido — então o boleto fica como previsão até baixar."
     )
 
     contas = list_contas(only_active=True)
-    cats = fetch_df("SELECT id, nome FROM categorias WHERE ativo=TRUE ORDER BY nome")
+    cats = cached_df("SELECT id, nome FROM categorias WHERE ativo=TRUE ORDER BY nome")
 
     if contas.empty:
         st.info("Cadastre contas primeiro.")
@@ -1066,99 +1084,138 @@ with tabs[4]:
         if conta_confs.empty:
             st.error("Você precisa de pelo menos uma conta do tipo CONTA (ex: Cora) para gerar o boleto.")
         else:
-            conta_id = st.selectbox(
-                "Conta para receber o boleto",
-                options=conta_confs["id"].tolist(),
-                format_func=lambda k: conta_confs.loc[conta_confs["id"] == k, "nome"].iloc[0],
-                key="bol_conta",
-            )
+            # FORM: evita rerun a cada mexida e diminui “desfoco”
+            with st.form("form_boletos", clear_on_submit=False):
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    conta_id = st.selectbox(
+                        "Conta do boleto (receber)",
+                        options=conta_confs["id"].tolist(),
+                        format_func=lambda k: conta_confs.loc[conta_confs["id"] == k, "nome"].iloc[0],
+                        key="bol_conta",
+                    )
+                with c2:
+                    ano = st.number_input("Ano (origem)", min_value=2000, max_value=2100, value=date.today().year, step=1, key="bol_ano")
+                with c3:
+                    mes = st.number_input("Mês (origem)", min_value=1, max_value=12, value=date.today().month, step=1, key="bol_mes")
+                with c4:
+                    venc = st.date_input("Vencimento do boleto", value=(date.today() + relativedelta(days=10)), key="bol_venc")
 
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                ano = st.number_input("Ano (origem)", min_value=2000, max_value=2100, value=date.today().year, step=1, key="bol_ano")
-            with c2:
-                mes = st.number_input("Mês (origem)", min_value=1, max_value=12, value=date.today().month, step=1, key="bol_mes")
-            with c3:
-                venc = st.date_input("Vencimento do boleto", value=(date.today() + relativedelta(days=10)), key="bol_venc")
+                c5, c6, c7 = st.columns(3)
+                with c5:
+                    cat_id = None
+                    if not cats.empty:
+                        cat_id = st.selectbox(
+                            "Categoria do boleto",
+                            options=cats["id"].tolist(),
+                            format_func=lambda k: cats.loc[cats["id"] == k, "nome"].iloc[0],
+                            key="bol_cat",
+                        )
+                with c6:
+                    texto = st.text_input("Filtrar descrição (contém)", value="", key="bol_txt")
+                with c7:
+                    mostrar_todos = st.checkbox("Mostrar tudo (ignora mês/ano)", value=False, key="bol_all")
 
-            cat_id = None
-            if not cats.empty:
-                cat_id = st.selectbox(
-                    "Categoria do boleto",
-                    options=cats["id"].tolist(),
-                    format_func=lambda k: cats.loc[cats["id"] == k, "nome"].iloc[0],
-                    key="bol_cat",
-                )
+                desc = st.text_input("Descrição do boleto", value=f"Boleto agrupado {int(mes):02d}/{int(ano)}", key="bol_desc")
+                st.caption("Clique em **Aplicar filtros** depois de ajustar os campos acima (melhora performance).")
 
-            dt_ini = date(int(ano), int(mes), 1)
-            dt_fim = (dt_ini + relativedelta(months=1)) - relativedelta(days=1)
+                st.form_submit_button("Aplicar filtros", use_container_width=True)
 
-            df_pend = fetch_df(
-                """
+            # período
+            if mostrar_todos:
+                dt_ini = date(2000, 1, 1)
+                dt_fim = date(2100, 12, 31)
+            else:
+                dt_ini = date(int(ano), int(mes), 1)
+                dt_fim = (dt_ini + relativedelta(months=1)) - relativedelta(days=1)
+
+            params = [dt_ini.isoformat(), dt_fim.isoformat()]
+            q = """
                 SELECT id, descricao, valor::float8 AS valor, dt_competencia
                   FROM lancamentos
                  WHERE tipo='RECEITA'
                    AND COALESCE(status,'Pendente')='Pendente'
                    AND dt_competencia BETWEEN %s AND %s
-                 ORDER BY dt_competencia, id
-                """,
-                [dt_ini.isoformat(), dt_fim.isoformat()],
-            )
+            """
+
+            if (texto or "").strip():
+                q += " AND descricao ILIKE %s"
+                params.append(f"%{texto.strip()}%")
+
+            q += " ORDER BY dt_competencia, id"
+
+            df_pend = cached_df(q, tuple(params))
 
             if df_pend.empty:
-                st.info("Nenhuma RECEITA pendente encontrada nesse mês.")
+                st.info("Nenhuma RECEITA pendente encontrada com os filtros atuais.")
             else:
-                df_show = df_pend.copy()
-                # Não exibir ID na tabela
-                if "id" in df_show.columns:
-                    df_show = df_show.drop(columns=["id"])
-                df_show = df_show.rename(columns={"descricao":"Descrição","valor":"Valor","dt_competencia":"Data"})
-                df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
-                df_show["Valor"] = df_show["Valor"].apply(br_money)
-                cols = ["Data","Descrição","Valor"]
-                cols = [c for c in cols if c in df_show.columns] + [c for c in df_show.columns if c not in cols]
-                df_show = df_show[cols]
-                st.dataframe(df_show, use_container_width=True, hide_index=True)
+                df_tbl = df_pend.copy()
+                df_tbl["Selecionar"] = False
+                df_tbl = df_tbl.rename(columns={"descricao": "Descrição", "valor": "Valor", "dt_competencia": "Data"})
+                df_tbl["Data"] = pd.to_datetime(df_tbl["Data"]).dt.strftime("%d/%m/%Y")
+                df_tbl["Valor"] = df_tbl["Valor"].apply(br_money)
 
-                ids = st.multiselect(
-                    "Selecione as receitas (IDs) para agrupar",
-                    options=df_pend["id"].tolist(),
-                    default=[],
-                    key="bol_ids",
+                edited = st.data_editor(
+                    df_tbl[["Selecionar", "Data", "Descrição", "Valor"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Selecionar": st.column_config.CheckboxColumn("✔"),
+                        "Data": st.column_config.TextColumn("Data"),
+                        "Descrição": st.column_config.TextColumn("Descrição"),
+                        "Valor": st.column_config.TextColumn("Valor"),
+                    },
+                    key="bol_table",
                 )
 
-                desc = st.text_input("Descrição do boleto", value=f"Boleto agrupado {int(mes):02d}/{int(ano)}", key="bol_desc")
+                selected_mask = edited["Selecionar"].astype(bool).values
+                ids = df_pend.loc[selected_mask, "id"].tolist()
 
-                if st.button("Gerar boleto", type="primary", use_container_width=True, key="bol_gerar"):
+                total = float(df_pend.loc[selected_mask, "valor"].sum()) if len(ids) else 0.0
+                st.info(f"Selecionados: {len(ids)} • Total: {br_money(total)}")
+
+                cbtn1, cbtn2 = st.columns([0.6, 0.4])
+                with cbtn1:
+                    gerar = st.button("Gerar boleto com selecionados", type="primary", use_container_width=True, key="bol_gerar")
+                with cbtn2:
+                    limpar = st.button("Limpar seleção", use_container_width=True, key="bol_limpar")
+
+                if limpar:
+                    st.session_state.pop("bol_table", None)
+                    st.rerun()
+
+                if gerar:
                     if not ids:
-                        st.error("Selecione pelo menos 1 receita.")
+                        st.error("Marque pelo menos uma receita.")
+                    elif total <= 0:
+                        st.error("Total inválido.")
                     else:
-                        total = float(df_pend.loc[df_pend["id"].isin(ids), "valor"].sum())
-                        if total <= 0:
-                            st.error("Total inválido.")
-                        else:
-                            row = fetch_one(
-                                """
-                                INSERT INTO lancamentos
-                                  (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status,prestacao)
-                                VALUES
-                                  ('RECEITA',%s,%s,%s,NULL,%s,NULL,%s,'Boleto','Pendente',NULL)
-                                RETURNING id
-                                """,
-                                [desc.strip(), total, venc.isoformat(), int(conta_id), (int(cat_id) if cat_id else None)],
-                            )
-                            boleto_id = int(row["id"])
+                        row = fetch_one(
+                            """
+                            INSERT INTO lancamentos
+                              (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status,prestacao)
+                            VALUES
+                              ('RECEITA',%s,%s,%s,NULL,%s,NULL,%s,'Boleto','Pendente',NULL)
+                            RETURNING id
+                            """,
+                            [desc.strip(), float(total), venc.isoformat(), int(conta_id), (int(cat_id) if cat_id else None)],
+                        )
+                        boleto_id = int(row["id"])
 
-                            exec_sql(
-                                "UPDATE lancamentos SET status='Agrupada', forma_pagamento=%s WHERE id = ANY(%s)",
-                                [f"Boleto:{boleto_id}", ids],
-                            )
+                        exec_sql(
+                            "UPDATE lancamentos SET status='Agrupada', forma_pagamento=%s WHERE id = ANY(%s)",
+                            [f"Boleto:{boleto_id}", ids],
+                        )
 
-                            toast_ok(f"Boleto criado (ID {boleto_id})", 3)
-                            st.rerun()
+                        st.toast(f"Boleto criado • Total {br_money(total)}", icon="✅")
+                        clear_cache()
+                        st.session_state.pop("bol_table", None)
+                        st.rerun()
 
     st.divider()
     st.markdown("### Desagrupar boleto")
+    st.caption("Se precisar desfazer, informe o ID interno do boleto (lançamento criado).")
+
     with st.expander("Desagrupar por ID do boleto", expanded=False):
         bid = st.number_input("ID do boleto", min_value=1, step=1, value=1, key="bol_des_id")
         confirm = st.checkbox("Confirmo que quero desfazer o agrupamento", key="bol_des_confirm")
@@ -1174,9 +1231,9 @@ with tabs[4]:
                     "DELETE FROM lancamentos WHERE id=%s AND tipo='RECEITA' AND forma_pagamento='Boleto'",
                     [int(bid)],
                 )
-                toast_ok("Agrupamento desfeito", 2)
+                clear_cache()
+                st.toast("Agrupamento desfeito", icon="✅")
                 st.rerun()
-
 # ---------------- Fechamento ----------------
 with tabs[5]:
     st.subheader("Fechamento e Pagamento de Faturas")
