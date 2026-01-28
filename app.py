@@ -1278,7 +1278,7 @@ with tabs[6]:
       FROM lancamentos l
       JOIN contas c ON c.id=l.conta_id
       LEFT JOIN categorias cat ON cat.id=l.categoria_id
-      WHERE l.dt_competencia BETWEEN %s AND %s
+      WHERE l.dt_competencia BETWEEN %s AND %s    
     """, [ini.isoformat(), fim.isoformat()])
 
     if df.empty:
