@@ -472,6 +472,17 @@ with tabs[2]:
     )
 
     if not df_fat_edit.empty:
+        # Visão rápida (datas em DD/MM/AAAA)
+        df_view = df_fat_edit.copy()
+        for col in ["competencia","dt_inicio","dt_fim","dt_fechamento","dt_vencimento"]:
+            df_view[col] = pd.to_datetime(df_view[col]).dt.strftime("%d/%m/%Y")
+        df_view = df_view.rename(columns={
+            "id":"ID","cartao":"Cartão","competencia":"Competência","dt_inicio":"Início","dt_fim":"Fim","dt_fechamento":"Fechamento","dt_vencimento":"Vencimento","status":"Status"
+        })
+        cols = ["ID","Cartão","Competência","Início","Fim","Fechamento","Vencimento","Status"]
+        df_view = df_view[cols]
+        st.dataframe(df_view, use_container_width=True, hide_index=True)
+
         df_show = df_fat_edit.copy()
         for col in ["competencia", "dt_inicio", "dt_fim", "dt_fechamento", "dt_vencimento"]:
             df_show[col] = pd.to_datetime(df_show[col]).dt.date
@@ -788,8 +799,13 @@ with tabs[3]:
             st.info("Nada para mostrar.")
         else:
             df_show = df.copy()
-            df_show["dt_competencia"] = pd.to_datetime(df_show["dt_competencia"]).dt.strftime("%d/%m/%Y")
-            df_show["valor"] = df_show["valor"].apply(br_money)
+            df_show = df_show.rename(columns={"id":"ID", "dt_competencia":"Data", "tipo":"Tipo", "descricao":"Descrição", "valor":"Valor", "conta":"Conta", "categoria":"Categoria", "prestacao":"Parcela"})
+            df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
+            df_show["Valor"] = df_show["Valor"].apply(br_money)
+            # Garante ID visível e primeiro
+            cols = ["ID","Data","Tipo","Descrição","Valor","Conta","Categoria","Parcela"]
+            cols = [c for c in cols if c in df_show.columns] + [c for c in df_show.columns if c not in cols]
+            df_show = df_show[cols]
             st.dataframe(df_show, use_container_width=True, hide_index=True)
 
             st.divider()
@@ -1039,8 +1055,12 @@ with tabs[4]:
                 st.info("Nenhuma RECEITA pendente encontrada nesse mês.")
             else:
                 df_show = df_pend.copy()
-                df_show["dt_competencia"] = pd.to_datetime(df_show["dt_competencia"]).dt.strftime("%d/%m/%Y")
-                df_show["valor"] = df_show["valor"].apply(br_money)
+                df_show = df_show.rename(columns={"id":"ID","descricao":"Descrição","valor":"Valor","dt_competencia":"Data"})
+                df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
+                df_show["Valor"] = df_show["Valor"].apply(br_money)
+                cols = ["ID","Data","Descrição","Valor"]
+                cols = [c for c in cols if c in df_show.columns] + [c for c in df_show.columns if c not in cols]
+                df_show = df_show[cols]
                 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
                 ids = st.multiselect(
