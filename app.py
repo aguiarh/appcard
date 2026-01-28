@@ -1,48 +1,41 @@
-# app_corrigido_neon.py — Controle Financeiro (Streamlit) — Postgres (Neon)
+# app_v2_cartoes_cora.py
+# Controle Financeiro V2 (Streamlit + Postgres/Neon)
+# - Contas: Cora (CONTA) + Cartões (CARTAO)
+# - Faturas: por mês com datas reais (fecha varia)
+# - Lançamentos: Receita/Despesa
+# - Pagamento de fatura: cria saída no Cora e marca fatura como PAGA
+#
 # Requisitos:
-#   python -m pip install streamlit pandas python-dateutil psycopg2-binary
+#   pip install streamlit pandas python-dateutil psycopg2-binary
 #
-# Secrets (Streamlit Cloud):
-#   DATABASE_URL = "postgresql://user:pass@host/db?sslmode=require&channel_binding=require"
-#   APP_USERS    = "silvia:Senha;admin:Senha"
-#
-# Rodar local (PowerShell):
-#   $env:APP_USERS="silvia:Senha;admin:Senha"
-#   $env:DATABASE_URL="postgresql://..."
-#   python -m streamlit run app_corrigido_neon.py
+# ENV:
+#   APP_USERS="hugo:Senha;admin:Senha"
+#   DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"
 
 import os
 import re
 import time
 import hmac
 import hashlib
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 
-# Postgres
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-
 # =========================
-# Helpers: segurança + login
+# Segurança / login simples
 # =========================
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _parse_users(raw: str) -> dict:
-    """
-    raw: 'user:pass;user2:pass2'
-    return: {user: sha256(pass)}
-    """
-    users = {}
+def _parse_users(raw: str) -> Dict[str, str]:
+    users: Dict[str, str] = {}
     raw = (raw or "").strip()
-    if not raw:
-        return users
     for part in raw.split(";"):
         part = part.strip()
         if not part or ":" not in part:
@@ -54,84 +47,53 @@ def _parse_users(raw: str) -> dict:
     return users
 
 def require_login() -> None:
-    raw = None
-    try:
-        raw = st.secrets.get("APP_USERS")  # type: ignore[attr-defined]
-    except Exception:
-        raw = None
-    if not raw:
-        raw = os.getenv("APP_USERS", "")
-
+    raw = os.getenv("APP_USERS", "")
     users = _parse_users(raw)
     if not users:
-        st.error("Credenciais não configuradas. Defina APP_USERS (ex: silvia:Senha;admin:Senha).")
+        st.error("APP_USERS não configurado. Ex: hugo:Senha;admin:Senha")
         st.stop()
 
-    if "auth_ok" not in st.session_state:
-        st.session_state["auth_ok"] = False
-    if "auth_user" not in st.session_state:
-        st.session_state["auth_user"] = ""
-
-    if st.session_state["auth_ok"]:
+    if st.session_state.get("auth_ok"):
         return
 
     st.markdown("<h2 style='text-align:center;'>🔒 Acesso restrito</h2>", unsafe_allow_html=True)
-    usuario = st.text_input("Usuário", key="login_user")
-    senha = st.text_input("Senha", type="password", key="login_pwd")
+    u = st.text_input("Usuário")
+    p = st.text_input("Senha", type="password")
 
-    if st.button("Entrar", type="primary", use_container_width=True, key="login_btn"):
-        usuario = (usuario or "").strip()
-        senha_hash = _sha256(senha or "")
-        ok = usuario in users and hmac.compare_digest(users[usuario], senha_hash)
+    if st.button("Entrar", type="primary", use_container_width=True):
+        u = (u or "").strip()
+        ok = u in users and hmac.compare_digest(users[u], _sha256(p or ""))
         if ok:
             st.session_state["auth_ok"] = True
-            st.session_state["auth_user"] = usuario
+            st.session_state["auth_user"] = u
             st.rerun()
         else:
             st.error("Usuário ou senha inválidos.")
-
     st.stop()
 
 def logout_button() -> None:
-    c1, c2 = st.columns([0.8, 0.2])
+    c1, c2 = st.columns([0.75, 0.25])
     with c1:
         st.caption(f"👤 Logado como: **{st.session_state.get('auth_user','')}**")
     with c2:
-        if st.button("Sair", use_container_width=True, key="logout_btn"):
+        if st.button("Sair", use_container_width=True):
             st.session_state["auth_ok"] = False
             st.session_state["auth_user"] = ""
             st.rerun()
 
-
 # =========================
-# Toast fixo (5s)
+# Helpers
 # =========================
-def toast_ok(msg: str, seconds: int = 5) -> None:
-    """
-    Streamlit 'toast' não permite tempo fixo.
-    Aqui a gente usa um placeholder (success) que fica na tela e some depois.
-    """
+def toast_ok(msg: str, seconds: int = 3) -> None:
     ph = st.empty()
     ph.success(f"OK ✅ {msg}")
     time.sleep(max(int(seconds), 1))
     ph.empty()
 
-
-# =========================
-# BRL: parse + format
-# =========================
 def br_money(v: float) -> str:
-    # 1630.0 -> "1.630,00"
     return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 def parse_brl(s: Any) -> float:
-    """
-    Aceita:
-      "1.630,00" -> 1630.0
-      "1630,00"  -> 1630.0
-      "1630.00"  -> 1630.0
-      1630       -> 1630.0
-    """
     if s is None:
         return 0.0
     if isinstance(s, (int, float)):
@@ -140,781 +102,631 @@ def parse_brl(s: Any) -> float:
     if not t:
         return 0.0
     t = t.replace("R$", "").strip()
-    # remove espaços, mantém dígitos, vírgula e ponto e sinal
     t = re.sub(r"[^\d,.\-]", "", t)
-
-    # Se tem vírgula e ponto, assume BR (ponto milhar, vírgula decimal)
     if "," in t and "." in t:
         t = t.replace(".", "").replace(",", ".")
-    else:
-        # Se só vírgula, vira decimal
-        if "," in t and "." not in t:
-            t = t.replace(",", ".")
-        # Se só ponto, já é decimal
+    elif "," in t:
+        t = t.replace(",", ".")
     try:
         return float(t)
     except Exception:
         return 0.0
 
+def month_start(d: date) -> date:
+    return date(d.year, d.month, 1)
 
 # =========================
-# Config + Layout
-# =========================
-st.set_page_config(page_title="Controle Financeiro", page_icon="💸", layout="wide")
-
-# PC: largura total; Mobile: padding confortável
-st.markdown(
-    """
-<style>
-@media (max-width: 768px) {
-  .block-container {
-    padding-left: 1rem !important;
-    padding-right: 1rem !important;
-  }
-}
-.stTabs [data-baseweb="tab"] {
-  font-weight: 800 !important;
-  padding: 12px 16px !important;
-}
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-# Login
-require_login()
-logout_button()
-
-st.markdown(
-    """
-<div style="text-align:center; margin-bottom: 1.5rem;">
-  <h1 style="font-weight:700; margin-bottom: 0.25rem;">
-    💸 Controle Financeiro <span style="color:#e63946;">❤️</span>
-  </h1>
-  <small style="color:#777;">Feito com <span style="color:#e63946;">❤️</span> pra Silvia</small>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
-modo_view = st.selectbox("Modo de visualização", ["Auto", "Celular", "PC"], index=0, key="view_mode")
-is_mobile = (modo_view == "Celular")
-
-
-# =========================
-# Banco (Postgres)
+# Banco
 # =========================
 def get_database_url() -> str:
-    url = ""
-    try:
-        url = st.secrets.get("DATABASE_URL", "")  # type: ignore[attr-defined]
-    except Exception:
-        url = ""
-    if not url:
-        url = os.getenv("DATABASE_URL", "")
-    return (url or "").strip()
+    return (os.getenv("DATABASE_URL", "") or "").strip()
 
 def get_conn():
     url = get_database_url()
     if not url:
         st.error("DATABASE_URL não configurada (Neon/Postgres).")
         st.stop()
-    # conn como context manager
     return psycopg2.connect(url)
 
 def init_db() -> None:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS lancamentos (
-                    id              BIGSERIAL PRIMARY KEY,
-                    descricao       TEXT NOT NULL,
-                    valor           NUMERIC(14,2) NOT NULL,
-                    data            DATE NOT NULL,      -- competência
-                    prestacao       TEXT,
-                    forma_pagamento TEXT,
-                    status          TEXT,
-                    categoria       TEXT,
-                    conta_corrente  TEXT,
-                    data_pagamento  DATE,               -- liquidação
-                    created_at      TIMESTAMPTZ DEFAULT NOW()
-                );
-                """
-            )
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS contas (
+              id            BIGSERIAL PRIMARY KEY,
+              nome          TEXT NOT NULL UNIQUE,
+              tipo          TEXT NOT NULL CHECK (tipo IN ('CONTA','CARTAO')),
+              ativo         BOOLEAN NOT NULL DEFAULT TRUE,
+              saldo_inicial NUMERIC(14,2) NOT NULL DEFAULT 0
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS categorias (
+              id BIGSERIAL PRIMARY KEY,
+              nome TEXT NOT NULL UNIQUE,
+              ativo BOOLEAN NOT NULL DEFAULT TRUE
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS faturas (
+              id            BIGSERIAL PRIMARY KEY,
+              conta_id      BIGINT NOT NULL REFERENCES contas(id),
+              competencia   DATE NOT NULL,
+              dt_inicio     DATE NOT NULL,
+              dt_fim        DATE NOT NULL,
+              dt_fechamento DATE NOT NULL,
+              dt_vencimento DATE NOT NULL,
+              status        TEXT NOT NULL DEFAULT 'ABERTA' CHECK (status IN ('ABERTA','FECHADA','PAGA')),
+              created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              UNIQUE (conta_id, competencia)
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_faturas_periodo ON faturas(conta_id, dt_inicio, dt_fim);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_faturas_status ON faturas(conta_id, status);")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS lancamentos (
+              id BIGSERIAL PRIMARY KEY,
+              tipo           TEXT NOT NULL CHECK (tipo IN ('RECEITA','DESPESA')),
+              descricao      TEXT NOT NULL,
+              valor          NUMERIC(14,2) NOT NULL CHECK (valor >= 0),
+              dt_competencia DATE NOT NULL,
+              dt_liquidacao  DATE,
+              conta_id       BIGINT NOT NULL REFERENCES contas(id),
+              fatura_id      BIGINT REFERENCES faturas(id),
+              categoria_id   BIGINT REFERENCES categorias(id),
+              forma_pagamento TEXT,
+              status         TEXT,
+              prestacao      TEXT,
+              created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lanc_conta_dt ON lancamentos(conta_id, dt_competencia);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_lanc_fatura ON lancamentos(fatura_id);")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pagamentos_fatura (
+              id BIGSERIAL PRIMARY KEY,
+              fatura_id BIGINT NOT NULL UNIQUE REFERENCES faturas(id),
+              lancamento_saida_id BIGINT NOT NULL UNIQUE REFERENCES lancamentos(id),
+              dt_pagamento DATE NOT NULL,
+              valor NUMERIC(14,2) NOT NULL CHECK (valor >= 0),
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """)
+        conn.commit()
+
+def seed_basico() -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO contas (nome, tipo, saldo_inicial)
+            VALUES ('Cora','CONTA',0),
+                   ('Cartão XP','CARTAO',0),
+                   ('Cartão Itaú','CARTAO',0)
+            ON CONFLICT (nome) DO NOTHING;
+            """)
+            cur.execute("""
+            INSERT INTO categorias (nome) VALUES
+              ('Saúde'), ('Alimentação'), ('Transporte'), ('Farmácia'), ('Educação'),
+              ('Lazer'), ('Pessoal'), ('Investimentos'), ('Trabalho'), ('Outros'),
+              ('Pagamento de Fatura')
+            ON CONFLICT (nome) DO NOTHING;
+            """)
         conn.commit()
 
 init_db()
-
+seed_basico()
 
 # =========================
-# CRUD
+# Consultas utilitárias
 # =========================
-CATEGORIAS = [
-    "Saúde", "Alimentação", "Transporte (Gasolina)", "Farmácia", "Educação",
-    "Lazer", "Crianças", "Pessoal", "Investimentos",
-    "Desnecessário", "Beleza", "Funcionários", "Trabalho", "Outros"
-]
-FORMAS_PAGAMENTO = ["", "PIX", "Débito", "Crédito", "Boleto", "Dinheiro", "Transferência"]
-STATUS_LISTA = ["Pago", "Pendente", "Atrasado", "Cancelado"]
-
-def inserir_varios(linhas: List[Dict[str, Any]]) -> None:
-    sql = """
-        INSERT INTO lancamentos
-        (descricao, valor, data, prestacao, forma_pagamento, status, categoria, conta_corrente, data_pagamento)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """
-    vals = []
-    for l in linhas:
-        vals.append(
-            (
-                (l.get("Descricao") or "").strip(),
-                float(l.get("Valor") or 0),
-                str(l.get("Data")),  # YYYY-MM-DD
-                (l.get("Prestacao") or "").strip(),
-                (l.get("Forma_de_Pagamento") or "").strip(),
-                (l.get("Status") or "").strip(),
-                (l.get("Categoria") or "").strip(),
-                (l.get("Conta_Corrente") or "").strip(),
-                l.get("Data_Pagamento") or None,
-            )
-        )
+def fetch_df(sql: str, params: Optional[List[Any]] = None) -> pd.DataFrame:
+    params = params or []
     with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(sql, vals)
-        conn.commit()
+        return pd.read_sql_query(sql, conn, params=params)
 
-def atualizar_lancamento(id_: int, dados: Dict[str, Any]) -> None:
-    sql = """
-        UPDATE lancamentos
-           SET descricao=%s,
-               valor=%s,
-               data=%s,
-               prestacao=%s,
-               forma_pagamento=%s,
-               status=%s,
-               categoria=%s,
-               conta_corrente=%s,
-               data_pagamento=%s
-         WHERE id=%s
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql,
-                (
-                    (dados.get("Descricao") or "").strip(),
-                    float(dados.get("Valor") or 0),
-                    str(dados.get("Data")),
-                    (dados.get("Prestacao") or "").strip(),
-                    (dados.get("Forma_de_Pagamento") or "").strip(),
-                    (dados.get("Status") or "").strip(),
-                    (dados.get("Categoria") or "").strip(),
-                    (dados.get("Conta_Corrente") or "").strip(),
-                    dados.get("Data_Pagamento") or None,
-                    int(id_),
-                ),
-            )
-        conn.commit()
-
-def atualizar_varios(df_edit: pd.DataFrame) -> Tuple[int, List[str]]:
-    """
-    df_edit com colunas:
-      ID, Descricao, Valor, DataISO, Prestacao, Forma_de_Pagamento, Categoria, Conta_Corrente, Data_PagamentoISO, Status
-    """
-    erros: List[str] = []
-    ok = 0
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            for idx, row in df_edit.iterrows():
-                try:
-                    id_ = int(row["ID"])
-                except Exception:
-                    erros.append(f"Linha {idx+1}: ID inválido.")
-                    continue
-
-                # data
-                try:
-                    dt = pd.to_datetime(str(row["DataISO"])).date()
-                except Exception:
-                    erros.append(f"Linha {idx+1}: Data inválida.")
-                    continue
-
-                # valor
-                v = parse_brl(row["Valor"])
-
-                # data pagamento (opcional)
-                dp = None
-                dp_raw = str(row.get("Data_PagamentoISO", "")).strip()
-                if dp_raw:
-                    try:
-                        dp = pd.to_datetime(dp_raw).date()
-                    except Exception:
-                        erros.append(f"Linha {idx+1}: Data_Pagamento inválida.")
-                        continue
-
-                try:
-                    cur.execute(
-                        """
-                        UPDATE lancamentos
-                           SET descricao=%s,
-                               valor=%s,
-                               data=%s,
-                               prestacao=%s,
-                               forma_pagamento=%s,
-                               status=%s,
-                               categoria=%s,
-                               conta_corrente=%s,
-                               data_pagamento=%s
-                         WHERE id=%s
-                        """,
-                        (
-                            str(row.get("Descricao", "")).strip(),
-                            float(v),
-                            dt.isoformat(),
-                            str(row.get("Prestacao", "")).strip(),
-                            str(row.get("Forma_de_Pagamento", "")).strip(),
-                            str(row.get("Status", "")).strip(),
-                            str(row.get("Categoria", "")).strip(),
-                            str(row.get("Conta_Corrente", "")).strip(),
-                            (dp.isoformat() if dp else None),
-                            id_,
-                        ),
-                    )
-                    ok += 1
-                except Exception as e:
-                    erros.append(f"Linha {idx+1}: erro ao salvar ({e}).")
-            conn.commit()
-    return ok, erros
-
-def get_por_id(id_: int):
+def fetch_one(sql: str, params: Optional[List[Any]] = None) -> Optional[Dict[str, Any]]:
+    params = params or []
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT id, descricao, valor, data, prestacao, forma_pagamento,
-                       status, categoria, conta_corrente, data_pagamento
-                  FROM lancamentos
-                 WHERE id=%s
-                """,
-                (int(id_),),
-            )
-            return cur.fetchone()
+            cur.execute(sql, params)
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-def deletar(id_: int) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM lancamentos WHERE id=%s", (int(id_),))
-        conn.commit()
-
-def liquidar_ids(ids: List[int], data_pag: date) -> None:
-    if not ids:
-        return
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(
-                """
-                UPDATE lancamentos
-                   SET status='Pago',
-                       data_pagamento=%s
-                 WHERE id=%s
-                """,
-                [(data_pag.isoformat(), int(i)) for i in ids],
-            )
-        conn.commit()
-
-def buscar_df(where_sql: str = "", params: Optional[List[Any]] = None, order_sql: str = "ORDER BY data DESC, id DESC") -> pd.DataFrame:
+def exec_sql(sql: str, params: Optional[List[Any]] = None) -> None:
     params = params or []
-    sql = f"""
-        SELECT
-            id AS "ID",
-            descricao AS "Descricao",
-            valor::float8 AS "Valor",
-            data AS "DataISO",
-            COALESCE(prestacao,'') AS "Prestacao",
-            COALESCE(forma_pagamento,'') AS "Forma_de_Pagamento",
-            COALESCE(categoria,'') AS "Categoria",
-            COALESCE(conta_corrente,'') AS "Conta_Corrente",
-            data_pagamento AS "Data_PagamentoISO",
-            COALESCE(status,'') AS "Status"
-        FROM lancamentos
-        {where_sql}
-        {order_sql}
-    """
-    with get_conn() as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
-
-    if df.empty:
-        return pd.DataFrame(columns=[
-            "ID","Descricao","Valor","DataISO","Prestacao","Forma_de_Pagamento","Categoria","Conta_Corrente","Data_PagamentoISO","Status"
-        ])
-
-    # datas em BR pra view (quando precisar)
-    df["Data"] = pd.to_datetime(df["DataISO"], errors="coerce").dt.strftime("%d/%m/%Y")
-    df["Data_Pagamento"] = pd.to_datetime(df["Data_PagamentoISO"], errors="coerce").dt.strftime("%d/%m/%Y")
-    return df
-
-def listar_opcoes_para_edicao(filtro_texto: str = "") -> List[Tuple[int, str]]:
-    where = ""
-    params: List[Any] = []
-    if filtro_texto.strip():
-        where = "WHERE descricao ILIKE %s OR categoria ILIKE %s OR conta_corrente ILIKE %s"
-        t = f"%{filtro_texto.strip()}%"
-        params = [t, t, t]
-    sql = f"""
-        SELECT id, descricao, valor::float8 AS valor, data, prestacao, COALESCE(status,'') AS status
-        FROM lancamentos
-        {where}
-        ORDER BY data DESC, id DESC
-        LIMIT 300
-    """
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, params)
-            rows = cur.fetchall()
+        conn.commit()
 
-    opcoes: List[Tuple[int, str]] = []
-    for (id_, desc, val, dt, prest, status) in rows:
-        data_br = pd.to_datetime(dt).strftime("%d/%m/%Y")
-        prest_txt = f" [{prest}]" if prest else ""
-        label = f"{data_br} • R$ {br_money(val)} • {desc}{prest_txt} • {status or 'Pendente'}"
-        opcoes.append((int(id_), label))
-    return opcoes
+def exec_many(sql: str, rows: List[Tuple[Any, ...]]) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, rows)
+        conn.commit()
 
+def list_contas(only_active: bool = True) -> pd.DataFrame:
+    w = "WHERE ativo = TRUE" if only_active else ""
+    return fetch_df(f"SELECT id, nome, tipo, saldo_inicial::float8 AS saldo_inicial, ativo FROM contas {w} ORDER BY tipo, nome")
+
+def list_categorias() -> pd.DataFrame:
+    return fetch_df("SELECT id, nome FROM categorias WHERE ativo = TRUE ORDER BY nome")
+
+def list_faturas(conta_id: Optional[int] = None) -> pd.DataFrame:
+    where = ""
+    params: List[Any] = []
+    if conta_id:
+        where = "WHERE f.conta_id = %s"
+        params.append(int(conta_id))
+    return fetch_df(f"""
+      SELECT f.id,
+             c.nome AS cartao,
+             f.competencia,
+             f.dt_inicio, f.dt_fim, f.dt_fechamento, f.dt_vencimento,
+             f.status
+      FROM faturas f
+      JOIN contas c ON c.id = f.conta_id
+      {where}
+      ORDER BY f.competencia DESC, c.nome ASC
+    """, params)
+
+def total_fatura(fatura_id: int) -> float:
+    row = fetch_one("""
+      SELECT COALESCE(SUM(valor),0)::float8 AS total
+      FROM lancamentos
+      WHERE fatura_id = %s AND tipo='DESPESA'
+    """, [int(fatura_id)])
+    return float(row["total"]) if row else 0.0
+
+def saldo_cora() -> float:
+    row = fetch_one("""
+      SELECT
+        c.saldo_inicial::float8
+        + COALESCE(SUM(CASE WHEN l.tipo='RECEITA' THEN l.valor ELSE 0 END),0)::float8
+        - COALESCE(SUM(CASE WHEN l.tipo='DESPESA' THEN l.valor ELSE 0 END),0)::float8
+        AS saldo
+      FROM contas c
+      LEFT JOIN lancamentos l ON l.conta_id = c.id
+      WHERE c.nome='Cora'
+      GROUP BY c.saldo_inicial
+    """)
+    return float(row["saldo"]) if row else 0.0
+
+def suggest_fatura_for_date(cartao_id: int, dt: date) -> Optional[int]:
+    row = fetch_one("""
+      SELECT id
+      FROM faturas
+      WHERE conta_id = %s
+        AND %s BETWEEN dt_inicio AND dt_fim
+      ORDER BY dt_fim DESC
+      LIMIT 1
+    """, [int(cartao_id), dt.isoformat()])
+    return int(row["id"]) if row else None
 
 # =========================
-# Parcelas (Prévia)
+# App UI
 # =========================
-def dividir_total_em_parcelas(valor_total: float, qtd: int) -> List[float]:
-    if qtd <= 1:
-        return [round(valor_total, 2)]
-    base = round(valor_total / qtd, 2)
-    parcelas = [base] * qtd
-    soma = round(sum(parcelas), 2)
-    diff = round(valor_total - soma, 2)
-    parcelas[-1] = round(parcelas[-1] + diff, 2)
-    return parcelas
+st.set_page_config(page_title="Controle Financeiro V2", page_icon="💳", layout="wide")
+require_login()
+logout_button()
 
-def gerar_previa_parcelas(
-    descricao: str,
-    qtd: int,
-    data_inicial: date,
-    modo: str,
-    valor_total: float | None,
-    valor_parcela: float | None,
-    forma_pag: str,
-    categoria: str,
-    conta: str,
-    status: str,
-) -> pd.DataFrame:
-    qtd = max(int(qtd), 1)
-    if modo == "Total → dividir por parcelas":
-        valores = dividir_total_em_parcelas(float(valor_total or 0.0), qtd)
-    else:
-        v = round(float(valor_parcela or 0.0), 2)
-        valores = [v] * qtd
-
-    linhas = []
-    for i in range(qtd):
-        dt = data_inicial + relativedelta(months=i)
-        linhas.append({
-            "Descricao": descricao.strip(),
-            "Valor": round(float(valores[i]), 2),
-            "Data": dt.strftime("%d/%m/%Y"),
-            "Prestacao": f"{i+1}/{qtd}" if qtd > 1 else "",
-            "Forma_de_Pagamento": forma_pag,
-            "Categoria": categoria,
-            "Conta_Corrente": conta,
-            "Data_Pagamento": (date.today().strftime("%d/%m/%Y") if status == "Pago" else ""),
-            "Status": status,
-        })
-    df = pd.DataFrame(linhas)
-    ordem = ["Descricao","Valor","Data","Prestacao","Forma_de_Pagamento","Categoria","Conta_Corrente","Data_Pagamento","Status"]
-    return df[[c for c in ordem if c in df.columns]]
-
-
-# =========================
-# UI: Tabs
-# =========================
-tab_lancar, tab_listar, tab_pendentes, tab_editar_lote, tab_excluir = st.tabs(
-    ["➕ Lançar (prévia)", "📋 Listar", "✅ Pendentes", "📝 Editar em lote", "🗑️ Excluir"]
+st.markdown(
+    """
+<div style="text-align:center; margin-bottom: 1rem;">
+  <h1 style="margin-bottom:0.25rem;">💳 Controle Financeiro V2</h1>
+  <small style="color:#666;">Cartões (fatura variável) + Cora (saldo) + Receitas</small>
+</div>
+""",
+    unsafe_allow_html=True,
 )
 
-# ---------------- TAB: Lançar ----------------
-with tab_lancar:
-    st.subheader("Novo lançamento (com prévia de parcelas)")
-
-    descricao = st.text_input("Descrição", placeholder="Ex: Mercado / Cartão / Curso...", key="l_desc")
-
-    if is_mobile:
-        qtd_parcelas = st.number_input("Qtd. parcelas", min_value=1, step=1, value=1, key="l_qtd")
-        data_inicial = st.date_input("Data da 1ª parcela", value=date.today(), format="DD/MM/YYYY", key="l_dtini")
+# KPIs topo
+colA, colB, colC = st.columns(3)
+with colA:
+    st.metric("Saldo Cora (R$)", br_money(saldo_cora()))
+with colB:
+    # Próximas faturas a pagar (total aberto/fechado não pago)
+    df_next = fetch_df("""
+      SELECT c.nome, f.dt_vencimento, f.id
+      FROM faturas f
+      JOIN contas c ON c.id=f.conta_id
+      WHERE f.status IN ('ABERTA','FECHADA')
+      ORDER BY f.dt_vencimento ASC
+      LIMIT 2
+    """)
+    if df_next.empty:
+        st.metric("Próxima fatura", "—")
     else:
-        c1, c2 = st.columns(2)
-        with c1:
-            qtd_parcelas = st.number_input("Qtd. parcelas", min_value=1, step=1, value=1, key="l_qtd")
-        with c2:
-            data_inicial = st.date_input("Data da 1ª parcela", value=date.today(), format="DD/MM/YYYY", key="l_dtini")
+        fid = int(df_next.iloc[0]["id"])
+        st.metric("Próxima fatura", f"{df_next.iloc[0]['nome']} • {pd.to_datetime(df_next.iloc[0]['dt_vencimento']).strftime('%d/%m/%Y')} • R$ {br_money(total_fatura(fid))}")
+with colC:
+    st.metric("Hoje", date.today().strftime("%d/%m/%Y"))
 
-    modo = st.radio(
-        "Como você quer informar o valor?",
-        ["Total → dividir por parcelas", "Parcela fixa → repetir valor em todas"],
-        horizontal=not is_mobile,
-        key="l_modo"
-    )
+tabs = st.tabs(["🏦 Contas", "🧾 Faturas", "➕ Lançamentos", "💳 Fechamento", "📊 BI"])
 
-    # Troca o number_input por text_input pra não virar '0,001500,00' quando digita em cima do 0,00
-    def valor_input(label: str, key: str, disabled: bool) -> str:
-        return st.text_input(
-            label,
-            value=("0,00" if key not in st.session_state else st.session_state.get(key, "0,00")),
-            placeholder="Ex: 1500,00",
-            disabled=disabled,
-            key=key,
-        )
+# ---------------- Contas ----------------
+with tabs[0]:
+    st.subheader("Contas")
+    dfc = list_contas(only_active=False)
+    st.dataframe(dfc, use_container_width=True, hide_index=True)
 
-    if is_mobile:
-        vtotal_txt = valor_input("Valor Total (R$)", "l_vtotal_txt", disabled=(modo != "Total → dividir por parcelas"))
-        vparc_txt  = valor_input("Valor da Parcela (R$)", "l_vparc_txt", disabled=(modo != "Parcela fixa → repetir valor em todas"))
-        forma_pag = st.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO, index=0, key="l_forma")
-        categoria = st.selectbox("Categoria", CATEGORIAS, index=0, key="l_cat")
-        conta = st.text_input("Conta Corrente", placeholder="Ex: Nubank, Itaú...", key="l_conta")
-        status = st.selectbox("Status", STATUS_LISTA, index=1, key="l_status")
-    else:
-        c3, c4 = st.columns(2)
-        with c3:
-            vtotal_txt = valor_input("Valor Total (R$)", "l_vtotal_txt", disabled=(modo != "Total → dividir por parcelas"))
-        with c4:
-            vparc_txt  = valor_input("Valor da Parcela (R$)", "l_vparc_txt", disabled=(modo != "Parcela fixa → repetir valor em todas"))
-
-        c5, c6 = st.columns(2)
-        with c5:
-            forma_pag = st.selectbox("Forma de Pagamento", FORMAS_PAGAMENTO, index=0, key="l_forma")
-        with c6:
-            categoria = st.selectbox("Categoria", CATEGORIAS, index=0, key="l_cat")
-
-        c7, c8 = st.columns(2)
-        with c7:
-            conta = st.text_input("Conta Corrente", placeholder="Ex: Nubank, Itaú...", key="l_conta")
-        with c8:
-            status = st.selectbox("Status", STATUS_LISTA, index=1, key="l_status")
-
-    st.divider()
-    b1, b2 = st.columns(2)
-    with b1:
-        btn_previa = st.button("Gerar prévia", type="primary", use_container_width=True, key="l_previa")
-    with b2:
-        btn_limpar = st.button("Limpar prévia", use_container_width=True, key="l_limpar")
-
-    if btn_limpar:
-        st.session_state.pop("previa_df", None)
-        st.rerun()
-
-    if btn_previa:
-        if not descricao.strip():
-            st.error("Preencha a **Descrição**.")
-        else:
-            v_total = parse_brl(vtotal_txt) if modo == "Total → dividir por parcelas" else None
-            v_parc = parse_brl(vparc_txt) if modo == "Parcela fixa → repetir valor em todas" else None
-            df_previa = gerar_previa_parcelas(
-                descricao=descricao,
-                qtd=int(qtd_parcelas),
-                data_inicial=data_inicial,
-                modo=modo,
-                valor_total=v_total,
-                valor_parcela=v_parc,
-                forma_pag=forma_pag,
-                categoria=categoria,
-                conta=conta,
-                status=status,
-            )
-            st.session_state["previa_df"] = df_previa
-            toast_ok("Prévia gerada", 3)
-
-    df_previa = st.session_state.get("previa_df")
-
-    if isinstance(df_previa, pd.DataFrame) and not df_previa.empty:
-        # Para evitar erro de compatibilidade do data_editor:
-        # - mostramos "Valor" como texto (BRL), e parseamos de volta no salvar.
-        df_previa_view = df_previa.copy()
-        df_previa_view["Valor"] = df_previa_view["Valor"].apply(br_money)
-
-        total_calc = float(df_previa["Valor"].sum())
-        st.caption(f"Total da prévia: **R$ {br_money(total_calc)}**")
-
-        st.write("### Prévia (ajuste se quiser e salve)")
-        edited = st.data_editor(
-            df_previa_view,
-            use_container_width=True,
-            hide_index=True,
-            key="l_editor",
-            column_config={
-                "Valor": st.column_config.TextColumn("Valor (R$)", help="Aceita 1500,00 ou 1.500,00"),
-                "Forma_de_Pagamento": st.column_config.SelectboxColumn("Forma de Pagamento", options=FORMAS_PAGAMENTO),
-                "Categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
-                "Status": st.column_config.SelectboxColumn("Status", options=STATUS_LISTA),
-                "Data": st.column_config.TextColumn("Data (dd/mm/aaaa)"),
-                "Data_Pagamento": st.column_config.TextColumn("Data Pgto (dd/mm/aaaa)"),
-            }
-        )
-
-        if st.button("Salvar parcelas 💾", type="primary", use_container_width=True, key="l_salvar"):
-            linhas = []
-            erros = []
-            for idx, row in edited.iterrows():
-                # Data
-                try:
-                    dt = pd.to_datetime(str(row["Data"]), dayfirst=True).date()
-                except Exception:
-                    erros.append(f"Linha {idx+1}: Data inválida '{row['Data']}' (use dd/mm/aaaa).")
-                    continue
-
-                # Valor (aceita BR) — agora vem como texto
-                v = parse_brl(row["Valor"])
-
-                # Data Pagamento (opcional)
-                dp_iso = None
-                dp_txt = str(row.get("Data_Pagamento", "")).strip()
-                if dp_txt:
-                    try:
-                        dp = pd.to_datetime(dp_txt, dayfirst=True).date()
-                        dp_iso = dp.isoformat()
-                    except Exception:
-                        erros.append(f"Linha {idx+1}: Data_Pagamento inválida '{row['Data_Pagamento']}' (use dd/mm/aaaa).")
-                        continue
-
-                linhas.append({
-                    "Descricao": str(row["Descricao"]).strip(),
-                    "Valor": float(v),
-                    "Data": dt.isoformat(),
-                    "Prestacao": str(row.get("Prestacao", "")).strip(),
-                    "Forma_de_Pagamento": str(row.get("Forma_de_Pagamento", "")).strip(),
-                    "Categoria": str(row.get("Categoria", "")).strip(),
-                    "Conta_Corrente": str(row.get("Conta_Corrente", "")).strip(),
-                    "Data_Pagamento": dp_iso,
-                    "Status": str(row.get("Status", "")).strip(),
-                })
-
-        if erros:
-            st.error("Corrija antes de salvar:\n\n- " + "\n- ".join(erros))
-        else:
-            inserir_varios(linhas)
-            toast_ok("Parcelas salvas com sucesso", 5)
-            st.session_state.pop("previa_df", None)
-            st.rerun()
-           
-    else:
-        st.info("Gere uma prévia para visualizar e salvar as parcelas.")
-
-
-# ---------------- TAB: Listar ----------------
-with tab_listar:
-    st.subheader("Lançamentos")
-
-    # Ordenação em PT-BR
-    ordem = st.selectbox(
-        "Ordenar por",
-        ["Mais recentes", "Mais antigas", "Maior valor", "Menor valor", "Descrição (A→Z)", "Descrição (Z→A)"],
-        index=0,
-        key="li_ordem",
-    )
-
-    texto = st.text_input("Buscar", placeholder="mercado / lazer / nubank...", key="li_busca")
-    status_f = st.selectbox("Status (filtro)", ["Todos"] + STATUS_LISTA, index=0, key="li_status")
-
-    where = ""
-    params: List[Any] = []
-    if texto.strip():
-        where = "WHERE (descricao ILIKE %s OR categoria ILIKE %s OR conta_corrente ILIKE %s)"
-        t = f"%{texto.strip()}%"
-        params += [t, t, t]
-    if status_f != "Todos":
-        where += (" AND " if where else "WHERE ") + "status = %s"
-        params.append(status_f)
-
-    if ordem == "Mais antigas":
-        order_sql = "ORDER BY data ASC, id ASC"
-    elif ordem == "Maior valor":
-        order_sql = "ORDER BY valor DESC, data DESC, id DESC"
-    elif ordem == "Menor valor":
-        order_sql = "ORDER BY valor ASC, data DESC, id DESC"
-    elif ordem == "Descrição (A→Z)":
-        order_sql = "ORDER BY descricao ASC, data DESC, id DESC"
-    elif ordem == "Descrição (Z→A)":
-        order_sql = "ORDER BY descricao DESC, data DESC, id DESC"
-    else:
-        order_sql = "ORDER BY data DESC, id DESC"
-
-    df = buscar_df(where_sql=where, params=params, order_sql=order_sql)
-    total = float(df["Valor"].sum()) if not df.empty else 0.0
-
+    st.markdown("### Nova conta/cartão")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total (R$)", br_money(total))
-    c2.metric("Qtd.", int(len(df)))
-    c3.metric("Média (R$)", br_money(total / len(df) if len(df) else 0.0))
+    with c1:
+        nome = st.text_input("Nome (ex: Cora, Cartão XP)", key="c_nome")
+    with c2:
+        tipo = st.selectbox("Tipo", ["CONTA", "CARTAO"], key="c_tipo")
+    with c3:
+        saldo_ini = st.text_input("Saldo inicial (apenas CONTA)", value="0,00", key="c_saldo")
+    if st.button("Adicionar", type="primary", use_container_width=True, key="c_add"):
+        if not nome.strip():
+            st.error("Informe o nome.")
+        else:
+            v = parse_brl(saldo_ini) if tipo == "CONTA" else 0.0
+            exec_sql(
+                "INSERT INTO contas (nome,tipo,saldo_inicial) VALUES (%s,%s,%s) ON CONFLICT (nome) DO NOTHING",
+                [nome.strip(), tipo, float(v)],
+            )
+            toast_ok("Conta criada")
+            st.rerun()
 
-    # View: sem ID e com Valor BR
-    if not df.empty:
-        view = df.drop(columns=["ID"], errors="ignore").copy()
-        view["Valor"] = view["Valor"].apply(br_money)
-        view = view.drop(columns=["DataISO","Data_PagamentoISO"], errors="ignore")
-        st.dataframe(view, use_container_width=True, hide_index=True, key="li_grid")
+# ---------------- Faturas ----------------
+with tabs[1]:
+    st.subheader("Faturas (datas reais por mês)")
+    contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
+    if contas_cartao.empty:
+        st.info("Cadastre pelo menos 1 cartão em Contas.")
     else:
-        st.info("Nada para mostrar com esses filtros.")
+        cartao_nome = st.selectbox("Cartão", contas_cartao["nome"].tolist(), key="f_cartao")
+        cartao_id = int(contas_cartao.loc[contas_cartao["nome"] == cartao_nome, "id"].iloc[0])
 
-
-# ---------------- TAB: Pendentes ----------------
-with tab_pendentes:
-    st.subheader("Pendentes / Liquidação")
-
-    texto = st.text_input("Buscar (descrição/categoria/conta)", placeholder="digita e filtra...", key="p_busca")
-
-    if is_mobile:
-        dt_ini = st.date_input("De", value=None, format="DD/MM/YYYY", key="p_ini")
-        dt_fim = st.date_input("Até", value=None, format="DD/MM/YYYY", key="p_fim")
-    else:
-        c1, c2 = st.columns(2)
+        st.markdown("#### Criar/Atualizar fatura do mês")
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
-            dt_ini = st.date_input("De", value=None, format="DD/MM/YYYY", key="p_ini")
+            competencia = st.date_input("Competência (dia 01)", value=month_start(date.today()), key="f_comp")
+            competencia = month_start(competencia)
         with c2:
-            dt_fim = st.date_input("Até", value=None, format="DD/MM/YYYY", key="p_fim")
+            dt_inicio = st.date_input("Início", value=(competencia - relativedelta(months=1) + relativedelta(days=2)), key="f_ini")
+        with c3:
+            dt_fim = st.date_input("Fim", value=(competencia + relativedelta(days=1)), key="f_fim")
+        with c4:
+            dt_fech = st.date_input("Fechamento", value=dt_fim, key="f_fech")
+        with c5:
+            dt_venc = st.date_input("Vencimento", value=(competencia + relativedelta(days=24)), key="f_venc")
 
-    where = "WHERE (status IN ('Pendente','Atrasado') OR status IS NULL OR status='')"
-    params: List[Any] = []
+        if st.button("Salvar fatura", type="primary", use_container_width=True, key="f_save"):
+            if dt_inicio > dt_fim:
+                st.error("Início não pode ser maior que Fim.")
+            else:
+                exec_sql(
+                    """
+                    INSERT INTO faturas (conta_id,competencia,dt_inicio,dt_fim,dt_fechamento,dt_vencimento,status)
+                    VALUES (%s,%s,%s,%s,%s,%s,'ABERTA')
+                    ON CONFLICT (conta_id, competencia) DO UPDATE
+                    SET dt_inicio=EXCLUDED.dt_inicio,
+                        dt_fim=EXCLUDED.dt_fim,
+                        dt_fechamento=EXCLUDED.dt_fechamento,
+                        dt_vencimento=EXCLUDED.dt_vencimento
+                    """,
+                    [cartao_id, competencia.isoformat(), dt_inicio.isoformat(), dt_fim.isoformat(), dt_fech.isoformat(), dt_venc.isoformat()],
+                )
+                toast_ok("Fatura salva")
+                st.rerun()
 
-    if texto.strip():
-        where += " AND (descricao ILIKE %s OR categoria ILIKE %s OR conta_corrente ILIKE %s)"
-        t = f"%{texto.strip()}%"
-        params += [t, t, t]
-    if dt_ini:
-        where += " AND data >= %s"
-        params.append(dt_ini.isoformat())
-    if dt_fim:
-        where += " AND data <= %s"
-        params.append(dt_fim.isoformat())
+        st.markdown("#### Lista de faturas")
+        dff = list_faturas(cartao_id)
+        if dff.empty:
+            st.info("Nenhuma fatura cadastrada para esse cartão.")
+        else:
+            dff_show = dff.copy()
+            for col in ["competencia","dt_inicio","dt_fim","dt_fechamento","dt_vencimento"]:
+                dff_show[col] = pd.to_datetime(dff_show[col]).dt.strftime("%d/%m/%Y")
+            st.dataframe(dff_show, use_container_width=True, hide_index=True)
 
-    df = buscar_df(where_sql=where, params=params, order_sql="ORDER BY data ASC, id ASC")
+# ---------------- Lançamentos ----------------
+with tabs[2]:
+    st.subheader("Lançamentos (Receitas e Despesas)")
+    contas = list_contas(only_active=True)
+    cats = list_categorias()
+
+    if contas.empty:
+        st.info("Cadastre contas primeiro.")
+    else:
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            tipo_l = st.selectbox("Tipo", ["DESPESA","RECEITA"], key="l_tipo")
+        with c2:
+            conta_nome = st.selectbox("Conta", contas["nome"].tolist(), key="l_conta")
+            conta_row = contas.loc[contas["nome"] == conta_nome].iloc[0]
+            conta_id = int(conta_row["id"])
+            conta_tipo = str(conta_row["tipo"])
+        with c3:
+            dt_comp = st.date_input("Data (competência)", value=date.today(), key="l_dt")
+        with c4:
+            valor_txt = st.text_input("Valor (R$)", value="0,00", key="l_valor")
+
+        desc = st.text_input("Descrição", key="l_desc")
+        c5, c6, c7 = st.columns(3)
+        with c5:
+            cat_nome = st.selectbox("Categoria", cats["nome"].tolist(), key="l_cat")
+            cat_id = int(cats.loc[cats["nome"] == cat_nome, "id"].iloc[0])
+        with c6:
+            forma = st.text_input("Forma (opcional)", value="", key="l_forma")
+        with c7:
+            status = st.text_input("Status (opcional)", value="", key="l_status")
+
+        fatura_id: Optional[int] = None
+        if conta_tipo == "CARTAO" and tipo_l == "DESPESA":
+            st.markdown("##### Fatura")
+            suggested = suggest_fatura_for_date(conta_id, dt_comp)
+            dff = list_faturas(conta_id)
+            if dff.empty:
+                st.warning("Cadastre a fatura desse cartão na aba Faturas para vincular as compras.")
+            else:
+                # build options
+                opts = []
+                for _, r in dff.iterrows():
+                    label = f"{r['cartao']} • {pd.to_datetime(r['competencia']).strftime('%m/%Y')} • vence {pd.to_datetime(r['dt_vencimento']).strftime('%d/%m/%Y')} • {r['status']}"
+                    opts.append((int(r["id"]), label))
+                default_idx = 0
+                if suggested:
+                    for i, (fid, _) in enumerate(opts):
+                        if fid == suggested:
+                            default_idx = i
+                            break
+                choice = st.selectbox("Vincular à fatura", options=list(range(len(opts))), format_func=lambda i: opts[i][1], index=default_idx, key="l_fatura_sel")
+                fatura_id = opts[choice][0]
+
+        dt_liq = st.date_input("Data liquidação (opcional)", value=None, key="l_dtliq")
+
+        if st.button("Salvar lançamento", type="primary", use_container_width=True, key="l_save"):
+            erros: List[str] = []
+            if not desc.strip():
+                erros.append("Descrição obrigatória.")
+            v = parse_brl(valor_txt)
+            if v <= 0:
+                erros.append("Valor deve ser maior que 0.")
+            if conta_tipo == "CARTAO" and tipo_l == "DESPESA" and not fatura_id:
+                erros.append("Selecione uma fatura para compras no cartão.")
+            if erros:
+                st.error("Ajuste:\n\n- " + "\n- ".join(erros))
+            else:
+                exec_sql(
+                    """
+                    INSERT INTO lancamentos
+                      (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status)
+                    VALUES
+                      (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    [
+                        tipo_l,
+                        desc.strip(),
+                        float(v),
+                        dt_comp.isoformat(),
+                        (dt_liq.isoformat() if dt_liq else None),
+                        conta_id,
+                        fatura_id,
+                        cat_id,
+                        (forma or None),
+                        (status or None),
+                    ],
+                )
+                toast_ok("Lançamento salvo")
+                st.rerun()
+
+        st.divider()
+        st.markdown("### Listagem")
+        filtro = st.text_input("Buscar (descrição)", value="", key="l_busca")
+        conta_f = st.selectbox("Filtrar por conta", ["Todas"] + contas["nome"].tolist(), key="l_fconta")
+        where = "WHERE 1=1"
+        params: List[Any] = []
+        if filtro.strip():
+            where += " AND descricao ILIKE %s"
+            params.append(f"%{filtro.strip()}%")
+        if conta_f != "Todas":
+            where += " AND conta_id = (SELECT id FROM contas WHERE nome=%s)"
+            params.append(conta_f)
+        df = fetch_df(f"""
+          SELECT l.id,
+                 l.tipo,
+                 l.descricao,
+                 l.valor::float8 AS valor,
+                 l.dt_competencia,
+                 c.nome AS conta,
+                 COALESCE(cat.nome,'') AS categoria,
+                 COALESCE(f.id,0) AS fatura_id
+          FROM lancamentos l
+          JOIN contas c ON c.id=l.conta_id
+          LEFT JOIN categorias cat ON cat.id=l.categoria_id
+          LEFT JOIN faturas f ON f.id=l.fatura_id
+          {where}
+          ORDER BY l.dt_competencia DESC, l.id DESC
+          LIMIT 400
+        """, params)
+        if df.empty:
+            st.info("Nada para mostrar.")
+        else:
+            df_show = df.copy()
+            df_show["dt_competencia"] = pd.to_datetime(df_show["dt_competencia"]).dt.strftime("%d/%m/%Y")
+            df_show["valor"] = df_show["valor"].apply(br_money)
+            st.dataframe(df_show.drop(columns=["fatura_id"]), use_container_width=True, hide_index=True)
+
+# ---------------- Fechamento ----------------
+with tabs[3]:
+    st.subheader("Fechamento e Pagamento de Faturas")
+    contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
+    if contas_cartao.empty:
+        st.info("Cadastre cartões em Contas.")
+    else:
+        cartao_nome = st.selectbox("Cartão", contas_cartao["nome"].tolist(), key="fc_cartao")
+        cartao_id = int(contas_cartao.loc[contas_cartao["nome"] == cartao_nome, "id"].iloc[0])
+        dff = list_faturas(cartao_id)
+        if dff.empty:
+            st.warning("Cadastre faturas para esse cartão.")
+        else:
+            # options
+            opts = []
+            for _, r in dff.iterrows():
+                fid = int(r["id"])
+                total = total_fatura(fid)
+                label = f"{pd.to_datetime(r['competencia']).strftime('%m/%Y')} • vence {pd.to_datetime(r['dt_vencimento']).strftime('%d/%m/%Y')} • {r['status']} • R$ {br_money(total)}"
+                opts.append((fid, label, r["status"]))
+            idx = 0
+            choice = st.selectbox("Fatura", options=list(range(len(opts))), format_func=lambda i: opts[i][1], index=idx, key="fc_fatura")
+            fatura_id = int(opts[choice][0])
+            status_fat = str(opts[choice][2])
+            total = total_fatura(fatura_id)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Total da fatura (R$)", br_money(total))
+            row = fetch_one("""
+              SELECT dt_inicio, dt_fim, dt_fechamento, dt_vencimento, status
+              FROM faturas WHERE id=%s
+            """, [fatura_id])
+            if row:
+                c2.metric("Período", f"{pd.to_datetime(row['dt_inicio']).strftime('%d/%m')} → {pd.to_datetime(row['dt_fim']).strftime('%d/%m')}")
+                c3.metric("Vencimento", pd.to_datetime(row["dt_vencimento"]).strftime("%d/%m/%Y"))
+
+            st.markdown("#### Ações")
+            a1, a2 = st.columns(2)
+            with a1:
+                if st.button("Marcar como FECHADA", use_container_width=True, key="fc_fechar"):
+                    if status_fat == "PAGA":
+                        st.warning("Já está PAGA.")
+                    else:
+                        exec_sql("UPDATE faturas SET status='FECHADA' WHERE id=%s", [fatura_id])
+                        toast_ok("Fatura fechada")
+                        st.rerun()
+
+            with a2:
+                if st.button("Marcar como ABERTA", use_container_width=True, key="fc_abrir"):
+                    if status_fat == "PAGA":
+                        st.warning("Já está PAGA.")
+                    else:
+                        exec_sql("UPDATE faturas SET status='ABERTA' WHERE id=%s", [fatura_id])
+                        toast_ok("Fatura aberta")
+                        st.rerun()
+
+            st.divider()
+            st.markdown("#### Registrar pagamento (saindo do Cora)")
+            cora = fetch_one("SELECT id FROM contas WHERE nome='Cora' AND ativo=TRUE")
+            if not cora:
+                st.error("Conta 'Cora' não encontrada.")
+            else:
+                dt_pg = st.date_input("Data do pagamento", value=date.today(), key="fc_pgdt")
+                valor_pg_txt = st.text_input("Valor pago (R$)", value=br_money(total), key="fc_pgval")
+                if st.button("Pagar fatura ✅", type="primary", use_container_width=True, key="fc_pagar"):
+                    if status_fat == "PAGA":
+                        st.warning("Fatura já está paga.")
+                    else:
+                        valor_pg = parse_brl(valor_pg_txt)
+                        if valor_pg <= 0:
+                            st.error("Valor pago inválido.")
+                        else:
+                            # categoria Pagamento de Fatura
+                            cat = fetch_one("SELECT id FROM categorias WHERE nome='Pagamento de Fatura'")
+                            cat_id = int(cat["id"]) if cat else None
+
+                            # cria lançamento de saída no Cora
+                            row = fetch_one("""
+                              SELECT c.nome AS cartao, f.competencia
+                              FROM faturas f JOIN contas c ON c.id=f.conta_id
+                              WHERE f.id=%s
+                            """, [fatura_id])
+                            comp_lbl = pd.to_datetime(row["competencia"]).strftime("%m/%Y") if row else ""
+                            desc = f"Pagamento Fatura - {cartao_nome} ({comp_lbl})"
+
+                            # inserir lançamento e obter id
+                            with get_conn() as conn:
+                                with conn.cursor() as cur:
+                                    cur.execute("""
+                                      INSERT INTO lancamentos
+                                        (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,categoria_id,forma_pagamento,status)
+                                      VALUES
+                                        ('DESPESA',%s,%s,%s,%s,%s,%s,'Transferência','Pago')
+                                      RETURNING id
+                                    """, (
+                                        desc,
+                                        float(valor_pg),
+                                        dt_pg.isoformat(),
+                                        dt_pg.isoformat(),
+                                        int(cora["id"]),
+                                        cat_id,
+                                    ))
+                                    lanc_id = int(cur.fetchone()[0])
+
+                                    cur.execute("""
+                                      INSERT INTO pagamentos_fatura (fatura_id, lancamento_saida_id, dt_pagamento, valor)
+                                      VALUES (%s,%s,%s,%s)
+                                    """, (fatura_id, lanc_id, dt_pg.isoformat(), float(valor_pg)))
+
+                                    cur.execute("UPDATE faturas SET status='PAGA' WHERE id=%s", (fatura_id,))
+                                conn.commit()
+
+                            toast_ok("Pagamento registrado e fatura marcada como PAGA", 4)
+                            st.rerun()
+
+            st.divider()
+            st.markdown("#### Itens da fatura")
+            df_it = fetch_df("""
+              SELECT l.dt_competencia, l.descricao, l.valor::float8 AS valor, COALESCE(cat.nome,'') AS categoria
+              FROM lancamentos l
+              LEFT JOIN categorias cat ON cat.id=l.categoria_id
+              WHERE l.fatura_id=%s
+              ORDER BY l.dt_competencia ASC, l.id ASC
+            """, [fatura_id])
+            if df_it.empty:
+                st.info("Sem lançamentos vinculados a essa fatura.")
+            else:
+                df_it["dt_competencia"] = pd.to_datetime(df_it["dt_competencia"]).dt.strftime("%d/%m/%Y")
+                df_it["valor"] = df_it["valor"].apply(br_money)
+                st.dataframe(df_it, use_container_width=True, hide_index=True)
+
+# ---------------- BI ----------------
+with tabs[4]:
+    st.subheader("BI do mês (Receitas x Despesas + por categoria)")
+    contas = list_contas(only_active=True)
+    mes_ref = st.date_input("Mês de referência", value=month_start(date.today()), key="bi_mes")
+    mes_ref = month_start(mes_ref)
+    ini = mes_ref
+    fim = (mes_ref + relativedelta(months=1) - relativedelta(days=1))
+
+    df = fetch_df("""
+      SELECT l.tipo,
+             l.valor::float8 AS valor,
+             l.dt_competencia,
+             COALESCE(cat.nome,'') AS categoria,
+             c.nome AS conta
+      FROM lancamentos l
+      JOIN contas c ON c.id=l.conta_id
+      LEFT JOIN categorias cat ON cat.id=l.categoria_id
+      WHERE l.dt_competencia BETWEEN %s AND %s
+    """, [ini.isoformat(), fim.isoformat()])
 
     if df.empty:
-        st.info("Sem pendências nesse filtro.")
+        st.info("Sem dados nesse mês.")
     else:
-        df_sel = df.copy()
-        df_sel.insert(0, "Selecionar", False)
+        rec = float(df.loc[df["tipo"]=="RECEITA", "valor"].sum())
+        desp = float(df.loc[df["tipo"]=="DESPESA", "valor"].sum())
+        saldo = rec - desp
 
-        # Mostrar BR e sem ID (mas mantém ID separado p/ liquidar)
-        df_show = df_sel.drop(columns=["ID","DataISO","Data_PagamentoISO"], errors="ignore").copy()
-        df_show["Valor"] = df_show["Valor"].apply(br_money)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Receitas (R$)", br_money(rec))
+        c2.metric("Despesas (R$)", br_money(desp))
+        c3.metric("Saldo do mês (R$)", br_money(saldo))
 
-        edited = st.data_editor(
-            df_show,
-            use_container_width=True,
-            hide_index=True,
-            key="p_editor",
-            column_config={"Selecionar": st.column_config.CheckboxColumn("Selecionar")},
-            disabled=[c for c in df_show.columns if c != "Selecionar"],
-        )
+        st.markdown("### Por categoria (Despesas)")
+        df_cat = df[df["tipo"]=="DESPESA"].groupby("categoria", as_index=False)["valor"].sum().sort_values("valor", ascending=False)
+        df_cat["valor"] = df_cat["valor"].apply(br_money)
+        st.dataframe(df_cat, use_container_width=True, hide_index=True)
 
-        linhas_marcadas = edited.index[edited["Selecionar"] == True].tolist()
-        ids = df_sel.loc[linhas_marcadas, "ID"].tolist() if linhas_marcadas else []
+        st.markdown("### Por dia (Receitas x Despesas)")
+        df_day = df.copy()
+        df_day["dia"] = pd.to_datetime(df_day["dt_competencia"]).dt.strftime("%d/%m")
+        piv = df_day.pivot_table(index="dia", columns="tipo", values="valor", aggfunc="sum", fill_value=0).reset_index()
+        st.dataframe(piv, use_container_width=True, hide_index=True)
 
-        data_pag = st.date_input("Data de Pagamento", value=date.today(), format="DD/MM/YYYY", key="p_pgto")
-        if st.button("Liquidar selecionados ✅", type="primary", use_container_width=True, key="p_btn"):
-            if not ids:
-                st.warning("Selecione pelo menos 1 lançamento.")
-            else:
-                liquidar_ids([int(i) for i in ids], data_pag)
-                toast_ok(f"{len(ids)} lançamento(s) liquidados", 5)
-                st.rerun()
-
-
-# ---------------- TAB: Editar em lote ----------------
-with tab_editar_lote:
-    st.subheader("Editar em lote (planilha)")
-    st.caption("Ideal pra corrigir várias parcelas de uma vez. Edite na planilha e salve no final.")
-
-    filtro = st.text_input("🔎 Buscar", placeholder="mercado / nubank / lazer...", key="el_busca")
-    status_f = st.selectbox("Status (filtro)", ["Todos"] + STATUS_LISTA, index=0, key="el_status")
-    limite = st.slider("Quantos itens carregar", min_value=20, max_value=500, value=120, step=20, key="el_limite")
-
-    where = ""
-    params: List[Any] = []
-    if filtro.strip():
-        where = "WHERE (descricao ILIKE %s OR categoria ILIKE %s OR conta_corrente ILIKE %s)"
-        t = f"%{filtro.strip()}%"
-        params += [t, t, t]
-    if status_f != "Todos":
-        where += (" AND " if where else "WHERE ") + "status = %s"
-        params.append(status_f)
-
-    df = buscar_df(where_sql=where, params=params, order_sql=f"ORDER BY data DESC, id DESC LIMIT {int(limite)}")
-
-    if df.empty:
-        st.info("Nada encontrado com esse filtro.")
-    else:
-        # Para editar com segurança:
-        # - DataISO e Data_PagamentoISO ficam em ISO e editáveis como texto
-        df_edit = df[[
-            "ID","Descricao","Valor","DataISO","Prestacao","Forma_de_Pagamento","Categoria","Conta_Corrente","Data_PagamentoISO","Status"
-        ]].copy()
-
-        # Valor mostra em BR, mas vai ser parseado no salvar
-        df_edit["Valor"] = df_edit["Valor"].apply(br_money)
-
-        edited = st.data_editor(
-            df_edit,
-            use_container_width=True,
-            hide_index=True,
-            key="el_editor",
-            column_config={
-                "ID": st.column_config.NumberColumn("ID", disabled=True),
-                "Valor": st.column_config.TextColumn("Valor (R$)", help="Ex: 1.500,00"),
-                "DataISO": st.column_config.TextColumn("Data (AAAA-MM-DD)"),
-                "Data_PagamentoISO": st.column_config.TextColumn("Data Pgto (AAAA-MM-DD)"),
-                "Forma_de_Pagamento": st.column_config.SelectboxColumn("Forma de Pagamento", options=FORMAS_PAGAMENTO),
-                "Categoria": st.column_config.SelectboxColumn("Categoria", options=CATEGORIAS),
-                "Status": st.column_config.SelectboxColumn("Status", options=STATUS_LISTA),
-            },
-        )
-
-        c1, c2 = st.columns([0.7, 0.3])
-        with c1:
-            st.caption("Dica: você pode copiar e colar colunas inteiras (tipo Excel).")
-        with c2:
-            if st.button("Salvar alterações em lote 💾", type="primary", use_container_width=True, key="el_save"):
-                ok, erros = atualizar_varios(edited)
-                if erros:
-                    st.error("Alguns itens não salvaram:\n\n- " + "\n- ".join(erros[:20]) + ("" if len(erros) <= 20 else f"\n\n(+{len(erros)-20} erros)"))
-                toast_ok(f"{ok} item(ns) atualizado(s)", 5)
-                st.rerun()
-
-
-# ---------------- TAB: Excluir ----------------
-with tab_excluir:
-    st.subheader("Excluir lançamento")
-    st.caption("Sem lixeira: excluiu, foi de base.")
-
-    filtro = st.text_input("🔎 Buscar para excluir", placeholder="mercado / nubank / lazer...", key="d_busca")
-    opcoes = listar_opcoes_para_edicao(filtro)
-
-    if not opcoes:
-        st.info("Nada encontrado com esse filtro.")
-    else:
-        # selectbox por ID (único) mas exibindo label amigável
-        id_options = [int(i) for (i, _) in opcoes]
-        label_map = {int(i): lbl for (i, lbl) in opcoes}
-        id_del = st.selectbox(
-            "Selecione",
-            options=id_options,
-            key="d_id",
-            format_func=lambda i: label_map.get(int(i), str(i)),
-            index=0,
-        )
-
-        confirmar = st.checkbox("Confirmo exclusão", key="d_conf")
-        if st.button("Excluir 🗑️", type="primary", use_container_width=True, key="d_btn"):
-            if not confirmar:
-                st.warning("Marque a confirmação.")
-            else:
-                deletar(int(id_del))
-                toast_ok("Lançamento excluído", 5)
-                st.rerun()
+        st.markdown("### Saldo Cora (agora)")
+        st.metric("Saldo Cora (R$)", br_money(saldo_cora()))
