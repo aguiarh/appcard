@@ -1188,7 +1188,7 @@ with tabs[4]:
                 SELECT id, descricao, valor::float8 AS valor, dt_competencia
                   FROM lancamentos
                  WHERE tipo='RECEITA'
-                   AND COALESCE(status,'Pendente')='Pendente'
+                   AND lower(trim(COALESCE(status,'Pendente'))) = 'pendente'
                    AND dt_competencia BETWEEN %s AND %s
             """
 
