@@ -344,7 +344,7 @@ with colB:
 with colC:
     st.metric("Hoje", date.today().strftime("%d/%m/%Y"))
 
-tabs = st.tabs(["🏦 Contas", "🏷️ Categorias", "🧾 Faturas", "➕ Lançamentos", "💳 Fechamento", "📊 BI"])
+tabs = st.tabs(["🏦 Contas", "🏷️ Categorias", "🧾 Faturas", "➕ Lançamentos", "🧾 Boletos", "💳 Fechamento", "📊 BI"])
 
 # ---------------- Contas ----------------
 with tabs[0]:
@@ -453,6 +453,77 @@ with tabs[1]:
 # ---------------- Faturas ----------------
 with tabs[2]:
     st.subheader("Faturas (datas reais por mês)")
+    st.caption("Edite o período (início/fim/fechamento/vencimento) das faturas existentes.")
+
+    df_fat_edit = fetch_df(
+        """
+        SELECT f.id,
+               c.nome AS cartao,
+               f.competencia,
+               f.dt_inicio,
+               f.dt_fim,
+               f.dt_fechamento,
+               f.dt_vencimento,
+               f.status
+          FROM faturas f
+          JOIN contas c ON c.id = f.conta_id
+         ORDER BY c.nome, f.competencia DESC
+        """
+    )
+
+    if not df_fat_edit.empty:
+        df_show = df_fat_edit.copy()
+        for col in ["competencia", "dt_inicio", "dt_fim", "dt_fechamento", "dt_vencimento"]:
+            df_show[col] = pd.to_datetime(df_show[col]).dt.date
+
+        edited_fat = st.data_editor(
+            df_show,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["id", "cartao", "competencia"],
+            column_config={
+                "dt_inicio": st.column_config.DateColumn("Início"),
+                "dt_fim": st.column_config.DateColumn("Fim"),
+                "dt_fechamento": st.column_config.DateColumn("Fechamento"),
+                "dt_vencimento": st.column_config.DateColumn("Vencimento"),
+                "status": st.column_config.SelectboxColumn("Status", options=["ABERTA", "FECHADA", "PAGA"]),
+            },
+            key="fat_editor",
+        )
+
+        if st.button("Salvar alterações das faturas", type="primary", use_container_width=True, key="fat_save"):
+            rows = []
+            for _, r in edited_fat.iterrows():
+                rows.append(
+                    (
+                        pd.to_datetime(r["dt_inicio"]).date().isoformat(),
+                        pd.to_datetime(r["dt_fim"]).date().isoformat(),
+                        pd.to_datetime(r["dt_fechamento"]).date().isoformat(),
+                        pd.to_datetime(r["dt_vencimento"]).date().isoformat(),
+                        str(r["status"]),
+                        int(r["id"]),
+                    )
+                )
+
+            exec_many(
+                """
+                UPDATE faturas
+                   SET dt_inicio=%s,
+                       dt_fim=%s,
+                       dt_fechamento=%s,
+                       dt_vencimento=%s,
+                       status=%s
+                 WHERE id=%s
+                """,
+                rows,
+            )
+            toast_ok("Faturas atualizadas", 2)
+            st.rerun()
+    else:
+        st.info("Nenhuma fatura cadastrada ainda.")
+
+    st.divider()
+
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
         st.info("Cadastre pelo menos 1 cartão em Contas.")
@@ -907,8 +978,130 @@ with tabs[3]:
                             st.rerun()
 
 
-# ---------------- Fechamento ----------------
+# ---------------- Boletos ----------------
 with tabs[4]:
+    st.subheader("Boletos (Agrupar receitas)")
+    st.caption(
+        "Selecione receitas PENDENTES já lançadas e gere um único boleto com vencimento futuro. "
+        "O boleto é criado como uma nova RECEITA Pendente. As receitas agrupadas ficam com status 'Agrupada'."
+    )
+
+    contas = list_contas(only_active=True)
+    cats = fetch_df("SELECT id, nome FROM categorias WHERE ativo=TRUE ORDER BY nome")
+
+    if contas.empty:
+        st.info("Cadastre contas primeiro.")
+    else:
+        conta_confs = contas.loc[contas["tipo"] == "CONTA"]
+        if conta_confs.empty:
+            st.error("Você precisa de pelo menos uma conta do tipo CONTA (ex: Cora) para gerar o boleto.")
+        else:
+            conta_id = st.selectbox(
+                "Conta para receber o boleto",
+                options=conta_confs["id"].tolist(),
+                format_func=lambda k: conta_confs.loc[conta_confs["id"] == k, "nome"].iloc[0],
+                key="bol_conta",
+            )
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                ano = st.number_input("Ano (origem)", min_value=2000, max_value=2100, value=date.today().year, step=1, key="bol_ano")
+            with c2:
+                mes = st.number_input("Mês (origem)", min_value=1, max_value=12, value=date.today().month, step=1, key="bol_mes")
+            with c3:
+                venc = st.date_input("Vencimento do boleto", value=(date.today() + relativedelta(days=10)), key="bol_venc")
+
+            cat_id = None
+            if not cats.empty:
+                cat_id = st.selectbox(
+                    "Categoria do boleto",
+                    options=cats["id"].tolist(),
+                    format_func=lambda k: cats.loc[cats["id"] == k, "nome"].iloc[0],
+                    key="bol_cat",
+                )
+
+            dt_ini = date(int(ano), int(mes), 1)
+            dt_fim = (dt_ini + relativedelta(months=1)) - relativedelta(days=1)
+
+            df_pend = fetch_df(
+                """
+                SELECT id, descricao, valor::float8 AS valor, dt_competencia
+                  FROM lancamentos
+                 WHERE tipo='RECEITA'
+                   AND COALESCE(status,'Pendente')='Pendente'
+                   AND dt_competencia BETWEEN %s AND %s
+                 ORDER BY dt_competencia, id
+                """,
+                [dt_ini.isoformat(), dt_fim.isoformat()],
+            )
+
+            if df_pend.empty:
+                st.info("Nenhuma RECEITA pendente encontrada nesse mês.")
+            else:
+                df_show = df_pend.copy()
+                df_show["dt_competencia"] = pd.to_datetime(df_show["dt_competencia"]).dt.strftime("%d/%m/%Y")
+                df_show["valor"] = df_show["valor"].apply(br_money)
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+                ids = st.multiselect(
+                    "Selecione as receitas (IDs) para agrupar",
+                    options=df_pend["id"].tolist(),
+                    default=[],
+                    key="bol_ids",
+                )
+
+                desc = st.text_input("Descrição do boleto", value=f"Boleto agrupado {int(mes):02d}/{int(ano)}", key="bol_desc")
+
+                if st.button("Gerar boleto", type="primary", use_container_width=True, key="bol_gerar"):
+                    if not ids:
+                        st.error("Selecione pelo menos 1 receita.")
+                    else:
+                        total = float(df_pend.loc[df_pend["id"].isin(ids), "valor"].sum())
+                        if total <= 0:
+                            st.error("Total inválido.")
+                        else:
+                            row = fetch_one(
+                                """
+                                INSERT INTO lancamentos
+                                  (tipo,descricao,valor,dt_competencia,dt_liquidacao,conta_id,fatura_id,categoria_id,forma_pagamento,status,prestacao)
+                                VALUES
+                                  ('RECEITA',%s,%s,%s,NULL,%s,NULL,%s,'Boleto','Pendente',NULL)
+                                RETURNING id
+                                """,
+                                [desc.strip(), total, venc.isoformat(), int(conta_id), (int(cat_id) if cat_id else None)],
+                            )
+                            boleto_id = int(row["id"])
+
+                            exec_sql(
+                                "UPDATE lancamentos SET status='Agrupada', forma_pagamento=%s WHERE id = ANY(%s)",
+                                [f"Boleto:{boleto_id}", ids],
+                            )
+
+                            toast_ok(f"Boleto criado (ID {boleto_id})", 3)
+                            st.rerun()
+
+    st.divider()
+    st.markdown("### Desagrupar boleto")
+    with st.expander("Desagrupar por ID do boleto", expanded=False):
+        bid = st.number_input("ID do boleto", min_value=1, step=1, value=1, key="bol_des_id")
+        confirm = st.checkbox("Confirmo que quero desfazer o agrupamento", key="bol_des_confirm")
+        if st.button("Desagrupar", type="primary", use_container_width=True, key="bol_des_btn"):
+            if not confirm:
+                st.error("Marque a confirmação.")
+            else:
+                exec_sql(
+                    "UPDATE lancamentos SET status='Pendente', forma_pagamento=NULL WHERE forma_pagamento=%s",
+                    [f"Boleto:{int(bid)}"],
+                )
+                exec_sql(
+                    "DELETE FROM lancamentos WHERE id=%s AND tipo='RECEITA' AND forma_pagamento='Boleto'",
+                    [int(bid)],
+                )
+                toast_ok("Agrupamento desfeito", 2)
+                st.rerun()
+
+# ---------------- Fechamento ----------------
+with tabs[5]:
     st.subheader("Fechamento e Pagamento de Faturas")
     contas_cartao = fetch_df("SELECT id, nome FROM contas WHERE tipo='CARTAO' AND ativo=TRUE ORDER BY nome")
     if contas_cartao.empty:
@@ -1039,7 +1232,7 @@ with tabs[4]:
                 st.dataframe(df_it, use_container_width=True, hide_index=True)
 
 # ---------------- BI ----------------
-with tabs[5]:
+with tabs[6]:
     st.subheader("BI do mês (Receitas x Despesas + por categoria)")
     contas = list_contas(only_active=True)
     mes_ref = st.date_input("Mês de referência", value=month_start(date.today()), key="bi_mes")
